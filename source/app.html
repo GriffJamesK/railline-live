@@ -515,16 +515,46 @@ function locate(r, x, y, hint) { // nearest arc-length on route; prefers the win
   return scan(0, n);
 }
 
-// ---------- consist estimates (cars including locomotives) ----------
+// ---------- train make-up (cars including locomotives) ----------
+// The feed doesn't report train length, so each route gets its usual make-up. kind: 'both' = power
+// car at each end (Acela, Brightline); 'double' = two locomotives up front (most long-distance trains);
+// 'single' = one locomotive; 'cab' = push-pull, one locomotive and a cab car at the far end; 'cars' =
+// through cars with no locomotive of their own. Trains that join or split en route change length at the
+// junction, judged from whether the train has passed that station.
+const passed = (status) => status === 'Departed' || status === 'Station';
 const CONSIST = [
-  [/acela/i, 8, 'both'], [/auto train/i, 28, 'double'], [/empire builder|coast starlight|lake shore|silver meteor|silver star|floridian/i, 11, 'double'],
-  [/zephyr|southwest chief|capitol limited|crescent/i, 10, 'double'], [/sunset|city of new orleans|texas eagle|cardinal/i, 8, 'double'],
-  [/northeast regional|regional/i, 8, 'cab'], [/palmetto|carolinian|keystone|pennsylvanian|vermonter|cascades|surfliner/i, 7, 'cab'],
-  [/piedmont|heartland|mardi gras|hartford|valley flyer|berkshire/i, 4, 'cab'], [/brightline/i, 7, 'both'],
+  [/acela/i, () => [8, 'both']],
+  [/brightline/i, () => [6, 'both']],
+  [/auto train/i, () => [40, 'double']],
+  // Seattle (7/8) and Portland (27/28) sections run together between Chicago and Spokane
+  [/empire builder/i, (num, st) => num === 27 || num === 28 ? [5, 'single']
+    : (num === 7 ? !passed(st('SPK')) : passed(st('SPK'))) ? [13, 'double'] : [9, 'double']],
+  // New York (48/49) and Boston (448/449) sections run together between Albany and Chicago
+  [/lake shore/i, (num, st) => num === 448 || num === 449 ? [5, 'single']
+    : (num === 49 ? passed(st('ALB')) : !passed(st('ALB'))) ? [14, 'double'] : [10, 'double']],
+  // Texas Eagle through cars ride on the Sunset Limited between San Antonio and Los Angeles
+  [/texas eagle/i, (num) => num === 421 || num === 422 ? [3, 'cars'] : [7, 'double']],
+  [/sunset/i, (num, st) => (num === 1 ? passed(st('SAS')) : !passed(st('SAS'))) ? [11, 'double'] : [8, 'double']],
+  [/coast starlight|silver meteor/i, () => [11, 'double']],
+  [/california zephyr|southwest chief|crescent|silver star|floridian/i, () => [10, 'double']],
+  [/capitol limited/i, () => [9, 'double']],
+  [/city of new orleans/i, () => [8, 'double']],
+  [/northeast regional/i, () => [9, 'single']],
+  [/cardinal|carolinian|palmetto/i, () => [7, 'single']],
+  [/pennsylvanian|vermonter|empire service|maple leaf|adirondack/i, () => [6, 'single']],
+  [/ethan allen|berkshire/i, () => [5, 'single']],
+  [/heartland|mardi gras/i, () => [4, 'single']],
+  [/cascades/i, () => [8, 'cab']],
+  [/pacific surfliner|wolverine/i, () => [7, 'cab']],
+  [/keystone|downeaster|hiawatha|blue water|lincoln|missouri river|illini|saluki|borealis/i, () => [6, 'cab']],
+  [/capitol corridor|san joaquin|pere marquette|sandburg|illinois zephyr/i, () => [5, 'cab']],
+  [/piedmont|valley flyer|hartford/i, () => [4, 'cab']],
 ];
-function consistFor(name) {
-  for (const [re, n, kind] of CONSIST) if (re.test(name)) return { n, kind };
-  return { n: 6, kind: 'cab' };
+function consistFor(info) {
+  const name = info.routeName || '', num = parseInt(info.trainNum, 10);
+  const st = (code) => { const s = (info.stations || []).find(x => x.code === code); return s && s.status; };
+  for (const [re, f] of CONSIST) if (re.test(name)) { const [n, kind] = f(num, st); return { n, kind }; }
+  return { n: 6, kind: 'single' };
 }
 
 // ---------- train state ----------
@@ -595,12 +625,21 @@ function ingest(data, fetchedAt) {
       st.placed = true; st.sDisp = MODEL.target(st, Date.now()); st.vDisp = v; MODEL.reached(st);
     }
     const late = lateness(t);
-    Object.assign(st, { info: t, late, tier: tier(late), consist: consistFor(t.routeName || ''), gone: false });
+    Object.assign(st, { info: t, late, tier: tier(late), consist: consistFor(t), px: x, py: y, gone: false });
     seen.add(id);
+  }
+  // Sections of one train listed separately at the same spot (joined en route): draw only one
+  const live = [...trains.values()].filter(t => seen.has(t.id));
+  for (const t of live) t.coupledTo = null;
+  for (let i = 0; i < live.length; i++) for (let j = i + 1; j < live.length; j++) {
+    const a = live[i], b = live[j];
+    if (Math.hypot(a.px - b.px, a.py - b.py) > 0.3 || Math.abs((+a.info.velocity || 0) - (+b.info.velocity || 0)) > 5) continue;
+    const [host, sec] = a.consist.n >= b.consist.n ? [a, b] : [b, a];
+    if (!sec.coupledTo) sec.coupledTo = host.id;
   }
   for (const st of trains.values()) if (!seen.has(st.id) && !st.gone) {
     st.gone = true;
-    const k = MODEL.finalArrival(st);
+    const k = st.coupledTo ? -1 : MODEL.finalArrival(st);
     if (k >= 0 && !document.hidden && !resyncPending) { pointAt(st.route, st.route.stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[st.tier] }); logArrival(st, k); announce(st, k); }
   }
   if (missing.size) fetchMissingStations([...missing]);
@@ -754,7 +793,7 @@ function stepTrains(dt) {
     t.alpha = t.gone ? Math.max(0, t.alpha - dt / 2) : Math.min(1, t.alpha + dt / 1.5);
     if (t.gone && t.alpha <= 0) { trains.delete(id); continue; }
     MODEL.step(t, dt, now); // after a jump, stops it skipped are dropped by MODEL.arrivals; the one it lands on can still ping
-    if (t.gone) continue;
+    if (t.gone || t.coupledTo) continue; // a coupled section arrives with its host
     const live = now - t.tMeas < 10 * 60000; // a stale report can still confirm a stop, but it isn't news
     for (const k of MODEL.arrivals(t)) {
       if (!live) continue;
@@ -1045,7 +1084,7 @@ function renderList() {
     sub.className = 'sub'; sub.textContent = 'to ' + r.to;
     st.className = 'd'; st.textContent = lateText(r.t.late);
     b.append(dot, main, st, sub);
-    b.onclick = () => selectTrain(r.t);
+    b.onclick = () => selectTrain(trains.get(r.t.coupledTo) || r.t);
     li.append(b); frag.append(li);
   }
   if (!rows.length) { const li = document.createElement('li'); li.className = 'empty'; li.textContent = trains.size ? 'No trains match' : 'No train data yet'; frag.append(li); }
@@ -1140,7 +1179,6 @@ function trainFacts(t) {
     ...(!at && next ? [row('Due', fmtTime(next.arr || next.dep, next.tz))] : []),
     row('Status', lateTxt, 'd'),
     row('Position report', ago(t.tMeas)),
-    row('Cars (est.)', String(t.consist.n)),
   ];
   return { title, rows, row };
 }
@@ -2005,7 +2043,7 @@ function trainBodies(order, G) {
       const bx = (tmpB[0] - view.x) * s + W / 2, by = (tmpB[1] - view.y) * s + H / 2;
       pts.push(bx, by); x0 = Math.min(x0, bx); x1 = Math.max(x1, bx); y0 = Math.min(y0, by); y1 = Math.max(y1, by);
       const len = Math.hypot(ax - bx, ay - by); if (len < 0.5) continue;
-      const loco = i === 0 || (kind === 'both' && i === n - 1) || (kind === 'double' && i === 1);
+      const loco = kind !== 'cars' && (i === 0 || (kind === 'both' && i === n - 1) || (kind === 'double' && i === 1));
       const p = fading ? (loco ? target.loco : target.car) : pathFor(loco ? t.tier : 'car');
       addCar(p, (ax + bx) / 2, (ay + by) / 2, (ax - bx) / len, (ay - by) / len, len / 2, G.wPx / 2, Math.min(G.wPx * 0.45, i === 0 ? G.wPx : G.wPx * 0.35));
     }
@@ -2121,6 +2159,7 @@ function frame(now) {
   const [vx0, vy0] = toWorld(0, 0), [vx1, vy1] = toWorld(W, H);
   const order = [];
   for (const t of trains.values()) {
+    if (t.coupledTo && trains.has(t.coupledTo)) continue; // drawn as part of the train it's coupled to
     pointAt(t.route, t.sDisp, tmpA);
     if (tmpA[0] < vx0 - pad || tmpA[0] > vx1 + pad || tmpA[1] < vy0 - pad || tmpA[1] > vy1 + pad) continue;
     order.push(t);
