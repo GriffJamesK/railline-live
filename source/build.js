@@ -117,24 +117,53 @@ for (let i = 0; i < segs.length; i++) if (!used[i]) { // pure loops
   const { k: end, pts } = walk(segs[i].ka, i); edges.push([nid(segs[i].ka), nid(end), pts]);
 }
 // Project, then split edges at stations so every on-network station is a graph node
-let E = edges.map(([a, b, pts]) => [a, b, pts.map(([lo, la]) => proj(lo, la))]);
+let E = edges.map(([a, b, pts]) => [a, b, pts.map(([lo, la]) => proj(lo, la)), 1]);
 const st = JSON.parse(fs.readFileSync(S + 'dn_amtrak-stations.geojson'));
+const SNAP_KM = 5; // a station joins the track network if it's within this distance of track
+const distToTrack = (P) => {
+  let best = 1e9;
+  for (const e of E) { const q = e[2]; for (let i = 0; i < q.length - 1; i++) {
+    const [ax, ay] = q[i], [bx, by] = q[i + 1], dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy || 1e-12;
+    const t = Math.max(0, Math.min(1, ((P[0] - ax) * dx + (P[1] - ay) * dy) / L)); best = Math.min(best, Math.hypot(ax + t * dx - P[0], ay + t * dy - P[1]));
+  } }
+  return best;
+};
+// Supplement: the FRA track layer predates some current Amtrak service (e.g. the Gulf Coast line
+// to Mobile, restored in 2025). Around stations it misses, Natural Earth railroads are added as extra
+// track, at a routing penalty so FRA track is preferred wherever both exist.
+{
+  const orphans = st.features.map(f => f.geometry.coordinates).filter(([lo, la]) => inBox(lo, la)).map(([lo, la]) => proj(lo, la)).filter(P => distToTrack(P) > SNAP_KM);
+  const ne = JSON.parse(fs.readFileSync(S + 'ne/ne_10m_railroads_north_america.geojson')).features.filter(f => f.properties.sov_a3 === 'USA' && f.geometry);
+  const keyMap = new Map(); let added = 0;
+  const nodeAt = (lo, la) => { const k = lo.toFixed(4) + ',' + la.toFixed(4); if (!keyMap.has(k)) { keyMap.set(k, nodes.length); nodes.push(proj(lo, la)); } return keyMap.get(k); };
+  for (const f of ne) {
+    const parts = f.geometry.type === 'LineString' ? [f.geometry.coordinates] : f.geometry.coordinates;
+    for (const cs of parts) {
+      if (cs.length < 2 || !cs.some(([lo, la]) => { const P = proj(lo, la); return orphans.some(O => Math.hypot(O[0] - P[0], O[1] - P[1]) < 80); })) continue;
+      const a = nodeAt(...cs[0]), b = nodeAt(...cs[cs.length - 1]);
+      E.push([a, b, cs.map(([lo, la]) => proj(lo, la)), 1.4]); added++;
+    }
+  }
+  console.log(`supplement: ${orphans.length} stations off FRA track, ${added} Natural Earth rail lines added`);
+}
 const stations = {}, stationNames = {};
 for (const f of st.features) {
   const [lo, la] = f.geometry.coordinates; if (!inBox(lo, la)) continue;
-  const P = proj(lo, la); let best = { d: 1e9 };
+  const P = proj(lo, la); let bestFra = { d: 1e9 }, bestAny = { d: 1e9 };
   E.forEach((e, ei) => {
     const p = e[2];
     for (let i = 0; i < p.length - 1; i++) {
       const [ax, ay] = p[i], [bx, by] = p[i + 1], dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy || 1e-12;
       let t = Math.max(0, Math.min(1, ((P[0] - ax) * dx + (P[1] - ay) * dy) / L));
       const x = ax + t * dx, y = ay + t * dy, d = Math.hypot(x - P[0], y - P[1]);
-      if (d < best.d) best = { d, ei, i, x, y };
+      if (d < bestAny.d) bestAny = { d, ei, i, x, y };
+      if (e[3] === 1 && d < bestFra.d) bestFra = { d, ei, i, x, y };
     }
   });
+  const best = bestFra.d <= SNAP_KM ? bestFra : bestAny; // FRA track first; supplementary only if none is near
   const code = f.properties.STNCODE;
   stationNames[code] = f.properties.STNNAME;
-  if (best.d > 3) { stations[code] = [-1, Math.round(P[0] / Q), Math.round(P[1] / Q)]; continue; }
+  if (best.d > SNAP_KM) { stations[code] = [-1, Math.round(P[0] / Q), Math.round(P[1] / Q)]; continue; }
   const e = E[best.ei], p = e[2];
   let id;
   const first = Math.hypot(best.x - p[0][0], best.y - p[0][1]) < 0.05, last = Math.hypot(best.x - p[p.length-1][0], best.y - p[p.length-1][1]) < 0.05;
@@ -142,11 +171,59 @@ for (const f of st.features) {
   else {
     id = nodes.length; nodes.push([best.x, best.y]);
     const A = p.slice(0, best.i + 1).concat([[best.x, best.y]]), B = [[best.x, best.y]].concat(p.slice(best.i + 1));
-    E[best.ei] = [e[0], id, A]; E.push([id, e[1], B]);
+    E[best.ei] = [e[0], id, A, e[3]]; E.push([id, e[1], B, e[3]]);
   }
   stations[code] = [id, Math.round(nodes[id][0] / Q), Math.round(nodes[id][1] / Q)];
 }
-const edgeOut = E.map(([a, b, pts]) => [a, b, enc(simplify(pts, 0.06))]);
+// Bridge gaps in the source data: dead ends that stop just short of other track (common at
+// junctions, river crossings and terminal approaches) are joined with a short connector, so routes
+// follow the track instead of falling back to straight lines between stations.
+{
+  const deg = new Array(nodes.length).fill(0), inc = nodes.map(() => new Set());
+  E.forEach(([a, b], ei) => { deg[a]++; deg[b]++; inc[a].add(ei); inc[b].add(ei); });
+  const dead = deg.map((d, i) => d === 1 ? i : -1).filter(i => i >= 0);
+  const dist = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]);
+  const shareEdge = (m, n) => [...inc[m]].some(e => inc[n].has(e));
+  // 1) facing dead ends within 5 km, closest pairs first
+  const pairs = [];
+  for (let i = 0; i < dead.length; i++) for (let j = i + 1; j < dead.length; j++) {
+    const d = dist(nodes[dead[i]], nodes[dead[j]]);
+    if (d < 5 && !shareEdge(dead[i], dead[j])) pairs.push([d, dead[i], dead[j]]);
+  }
+  pairs.sort((x, y) => x[0] - y[0]);
+  const joined = new Set(); let nPair = 0, nEdge = 0;
+  for (const [d, m, n] of pairs) {
+    if (joined.has(m) || joined.has(n)) continue;
+    E.push([m, n, [nodes[m], nodes[n]], 1]); joined.add(m); joined.add(n); nPair++;
+  }
+  // 2) other dead ends: to the nearest point on any track within 3 km
+  for (const n of dead) {
+    if (joined.has(n)) continue;
+    const P = nodes[n]; let best = { d: 3 };
+    E.forEach((e, ei) => {
+      if (e[0] === n || e[1] === n) return;
+      const q = e[2];
+      for (let i = 0; i < q.length - 1; i++) {
+        const [ax, ay] = q[i], [bx, by] = q[i + 1], dx = bx - ax, dy = by - ay, L = dx * dx + dy * dy || 1e-12;
+        const t = Math.max(0, Math.min(1, ((P[0] - ax) * dx + (P[1] - ay) * dy) / L)), x = ax + t * dx, y = ay + t * dy, d = Math.hypot(x - P[0], y - P[1]);
+        if (d < best.d) best = { d, ei, i, x, y };
+      }
+    });
+    if (best.ei == null) continue;
+    const e = E[best.ei], q = e[2];
+    let id;
+    if (dist([best.x, best.y], q[0]) < 0.05) id = e[0];
+    else if (dist([best.x, best.y], q[q.length - 1]) < 0.05) id = e[1];
+    else {
+      id = nodes.length; nodes.push([best.x, best.y]);
+      E[best.ei] = [e[0], id, q.slice(0, best.i + 1).concat([[best.x, best.y]]), e[3]];
+      E.push([id, e[1], [[best.x, best.y]].concat(q.slice(best.i + 1)), e[3]]);
+    }
+    E.push([n, id, [P, [best.x, best.y]], 1]); joined.add(n); nEdge++;
+  }
+  console.log(`gap bridging: ${dead.length} dead ends, ${nPair} joined in pairs, ${nEdge} joined to nearby track`);
+}
+const edgeOut = E.map(([a, b, pts, w]) => w === 1 ? [a, b, enc(simplify(pts, 0.06))] : [a, b, enc(simplify(pts, 0.06)), w]);
 const nodeOut = nodes.map(([x, y]) => [Math.round(x / Q), Math.round(y / Q)]);
 // connectivity report
 const g = nodes.map(() => []); E.forEach(([a, b]) => { g[a].push(b); g[b].push(a); });

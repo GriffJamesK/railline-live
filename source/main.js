@@ -72,10 +72,10 @@ function inUS(x, y) {
 
 // Track graph
 const nodes = GEO.nodes.map(([x, y]) => [x * Q, y * Q]);
-const edges = GEO.edges.map(([a, b, d]) => {
+const edges = GEO.edges.map(([a, b, d, w]) => {
   const pts = dec(d); let len = 0;
   for (let i = 2; i < pts.length; i += 2) len += Math.hypot(pts[i] - pts[i - 2], pts[i + 1] - pts[i - 1]);
-  return { a, b, pts, len };
+  return { a, b, pts, len: len * (w || 1) }; // w > 1: supplementary track, used only where needed
 });
 const adj = nodes.map(() => []);
 edges.forEach((e, i) => { adj[e.a].push(i, e.b); adj[e.b].push(i, e.a); });
