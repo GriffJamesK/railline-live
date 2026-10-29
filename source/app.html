@@ -492,7 +492,7 @@ function applyZoom(k) {
 
 // ---------- base map (painted by the renderer, composited here) ----------
 const base = {
-  worker: null, cur: null, prev: null, sent: null, seq: 0, force: true, interactiveSent: false,
+  worker: null, frames: [], sent: null, seq: 0, force: true, interactiveSent: false,
 };
 function startRenderer() {
   const tileSrc = '(' + tileWorker.toString() + ')()';
@@ -505,8 +505,8 @@ function startRenderer() {
   const onMsg = (ev) => {
     const m = ev.data;
     if (m.type === 'frame') {
-      if (base.prev && base.prev.bmp.close) base.prev.bmp.close();
-      base.prev = base.cur; base.cur = m;
+      m.t0 = performance.now(); base.frames.push(m);
+      while (base.frames.length > 4) closeFrame(base.frames.shift());
       if (m.settled && !m.preloading) loading.mapReady = true;
       loading.step();
     } else if (m.type === 'progress') { loading.tiles = m; loading.step(); }
@@ -550,16 +550,24 @@ function baseRect(f) {
   const k = view.s / f.s;
   return [(f.x - view.x) * view.s + W / 2 - (f.BW / 2) * k, (f.y - view.y) * view.s + H / 2 - (f.BH / 2) * k, f.BW * k, f.BH * k];
 }
-// Usually the newest image covers the whole screen and is the only thing drawn; while it is still
-// catching up with a fast zoom or pan, the previous image and the ground color fill the edges
-function drawBase() {
-  const c = base.cur;
-  const r = c && baseRect(c), covers = r && r[0] <= 0.5 && r[1] <= 0.5 && r[0] + r[2] >= W - 0.5 && r[1] + r[3] >= H - 0.5;
-  if (!covers) {
-    ctx.fillStyle = COL.ground; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    if (base.prev) { const q = baseRect(base.prev); ctx.drawImage(base.prev.bmp, q[0] * DPR, q[1] * DPR, q[2] * DPR, q[3] * DPR); }
+// Each new image fades in over the ones before it, so newly loaded tiles and sharper detail blend
+// in instead of popping. Images fully hidden under a newer opaque one that fills the screen are freed.
+const FADE_MS = reduceMotion ? 0 : 260;
+const closeFrame = (f) => { if (f.bmp.close) f.bmp.close(); };
+const frameAlpha = (f, i, now) => i === 0 || !FADE_MS ? 1 : Math.min(1, (now - f.t0) / FADE_MS);
+function coversScreen(f) { const r = baseRect(f); return r[0] <= 0.5 && r[1] <= 0.5 && r[0] + r[2] >= W - 0.5 && r[1] + r[3] >= H - 0.5; }
+function drawBase(now) {
+  const fr = base.frames;
+  for (let i = fr.length - 1; i > 0; i--) {
+    if (frameAlpha(fr[i], i, now) >= 1 && coversScreen(fr[i])) { fr.splice(0, i).forEach(closeFrame); break; }
   }
-  if (c) ctx.drawImage(c.bmp, r[0] * DPR, r[1] * DPR, r[2] * DPR, r[3] * DPR);
+  if (!fr.length || !coversScreen(fr[0])) { ctx.fillStyle = COL.ground; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+  for (let i = 0; i < fr.length; i++) {
+    const r = baseRect(fr[i]);
+    ctx.globalAlpha = frameAlpha(fr[i], i, now);
+    ctx.drawImage(fr[i].bmp, r[0] * DPR, r[1] * DPR, r[2] * DPR, r[3] * DPR);
+  }
+  ctx.globalAlpha = 1;
 }
 
 // ---------- input ----------
@@ -1105,6 +1113,30 @@ function rendererMain() {
     }
     lastZ[kind] = z;
     const cx = (tx0 + tx1) / 2, cy = (ty0 + ty1) / 2, exact = [], fillMap = new Map(); let ready = 0, total = 0;
+    // Buffer: request (but don't draw) a ring of tiles just outside the view, and the next coarser
+    // level, so most tiles are already loaded by the time a pan or zoom brings them into view
+    const ring = (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= 30 ? 2 : 1;
+    for (let ty = ty0 - ring; ty <= ty1 + ring; ty++) for (let tx = tx0 - ring; tx <= tx1 + ring; tx++) {
+      if (tx >= tx0 && tx <= tx1 && ty >= ty0 && ty <= ty1) continue;
+      if (tx >= 0 && ty >= 0 && tx < 2 ** z && ty < 2 ** z) get(kind, z, tx, ty, 30 + Math.hypot(tx - cx, ty - cy));
+    }
+    if (z > minZ) for (let ty = (ty0 >> 1); ty <= (ty1 >> 1); ty++) for (let tx = (tx0 >> 1); tx <= (tx1 >> 1); tx++) get(kind, z - 1, tx, ty, 20);
+    // Draw the whole view from one level when possible: the wanted level if it's fully loaded,
+    // else the most detailed coarser level that is. Detail then sharpens across the whole screen at
+    // once (and crossfades on the page) instead of filling in tile by tile with visible seams.
+    for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) get(kind, z, tx, ty, Math.hypot(tx - cx, ty - cy));
+    for (let zz = z; zz >= Math.max(minZ, z - 3); zz--) {
+      const sh = z - zz, list = [];
+      let ok = true;
+      for (let ty = ty0 >> sh; ty <= ty1 >> sh && ok; ty++) for (let tx = tx0 >> sh; tx <= tx1 >> sh && ok; tx++) {
+        const e = cache.get(keyOf(kind, zz, tx, ty));
+        if (e && e.state === 'ready') { e.used = stamp; list.push(e); continue; }
+        if (e && e.state === 'error') continue; // missing at the source (e.g. open ocean); nothing to wait for
+        const kids = readyDescendants(kind, zz, tx, ty, 2);
+        if (kids) list.push(...kids); else ok = false;
+      }
+      if (ok) return { exact: list, fills: [], ready: zz === z ? 1 : 0, z };
+    }
     for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
       total++;
       const e = get(kind, z, tx, ty, Math.hypot(tx - cx, ty - cy));
@@ -1173,8 +1205,19 @@ function rendererMain() {
     }
     c.setTransform(M);
   }
+  let holdSeq = -1, holds = 0;
   function render(v) {
     const { x: vx, y: vy, s, W, H, dpr } = v, BW = W + 2 * MARGIN, BH = H + 2 * MARGIN;
+    if (!v.interactive && !preloading) {
+      if (v.seq !== holdSeq) { holdSeq = v.seq; holds = 0; }
+      const hx0 = vx - W / 2 / s, hx1 = vx + W / 2 / s, hy0 = vy - H / 2 / s, hy1 = vy + H / 2 / s;
+      const hb = lonLatBox(hx0, hy0, hx1, hy1), kp = Math.cos(unproj(vx, vy)[1] * rad);
+      const zvf = Math.log2(40075 * kp * s / 512) + 0.5;
+      const ok = cover('dem', Math.log2(40075 * kp * s / 256) - 1, hb, 4, 14).ready >= 1 &&
+        (!(vecTemplate && zvf >= 9) || cover('vec', zvf, hb, 9, vecMax).ready >= 1);
+      pump();
+      if (!ok && holds++ < 6) { requestRender(100); return; } // waits at most ~0.6 s
+    }
     const cw = Math.round(BW * dpr), chh = Math.round(BH * dpr);
     if (!canvas) { canvas = mk(cw, chh); ctx = canvas.getContext('2d', { alpha: false }); }
     else if (canvas.width !== cw || canvas.height !== chh) { canvas.width = cw; canvas.height = chh; }
@@ -1485,7 +1528,7 @@ function frame(now) {
   requestBase(now);
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  drawBase();
+  drawBase(now);
 
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   const pad = 400 / view.s + 50;
