@@ -130,7 +130,7 @@ canvas.over-train { cursor: pointer; }
 #veil .bar i { transition: transform 0.4s ease; }
 #veilMsg { font: 12px var(--font-data); color: var(--ink-dim); font-variant-numeric: tabular-nums; }
 @media (prefers-reduced-motion: reduce) { #veil, #veil .bar i { transition: none; } }
-@media (max-width: 520px) { .credit { display: none; } #status { min-width: 0; } #info { width: auto; right: 70px; } }
+@media (max-width: 520px) { .credit .more { display: none; } .credit { max-width: none; } #status { min-width: 0; } #info { width: auto; right: 70px; } }
 </style>
 </head>
 <body>
@@ -161,7 +161,7 @@ canvas.over-train { cursor: pointer; }
   <button id="zin" type="button" aria-label="Zoom in">+</button>
   <button id="zout" type="button" aria-label="Zoom out">−</button>
 </div>
-<div class="credit">Positions: <a href="https://amtraker.com" target="_blank" rel="noopener">Amtraker</a> · Track: FRA · Terrain: AWS Terrain Tiles · Streets: <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a>, © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> · Natural Earth</div>
+<div class="credit">Train data: <a href="https://amtraker.com" target="_blank" rel="noopener">Amtraker</a> (<a href="https://opendatacommons.org/licenses/by/1-0/" target="_blank" rel="noopener">ODC-By</a>)<span class="more"> · Track: FRA · Terrain: AWS Terrain Tiles · Streets: <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a>, © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> · Natural Earth</span></div>
 
 <script>
 /*__GEO__*/
@@ -407,25 +407,32 @@ function ingest(data, fetchedAt) {
     if (known.length < 2) continue;
     const route = buildRoute(known);
     if (route.total < 1) continue;
-    let ts = parseTime(t.lastValTS);
-    if (!isFinite(ts) || ts > fetchedAt + 60000 || ts < fetchedAt - 30 * 60000) ts = fetchedAt;
     const id = t.trainID || (t.routeName + t.trainNum);
     let st = trains.get(id);
-    const hint = st && st.route === route ? st.sDisp : null;
-    const loc = locate(route, x, y, hint);
+    if (st && st.route !== route) { // same train, rebuilt route (e.g. more stations became known): keep its place
+      pointAt(st.route, st.sDisp, tmpA);
+      st.sDisp = locate(route, tmpA[0], tmpA[1], null).s; st.route = route; st.sig = null;
+      st.pinged = new Set(); markPassed(st);
+    }
+    const loc = locate(route, x, y, st ? st.sDisp : null);
     if (loc.d > 60) continue; // position nowhere near its scheduled route
     const v = Math.max(0, (+t.velocity || 0) * MPH);
-    if (!st || st.route !== route) {
-      const now = Date.now(), s0 = Math.min(route.total, loc.s + v * Math.min(180, (now - ts) / 1000));
-      st = { id, route, sDisp: s0, vDisp: v, alpha: firstPollDone ? 0 : 1, pinged: new Set() };
-      route.stopS.forEach((ss, k) => { if (ss <= s0 + 0.1) st.pinged.add(k); }); // no pings for stops already behind it
+    // When the report was taken. The feed repeats the same report for several polls; it keeps the
+    // time it was first seen, so the train keeps moving from it instead of being pulled back
+    let ts = parseTime(t.lastValTS);
+    if (!isFinite(ts) || ts > fetchedAt + 60000 || ts < fetchedAt - 60 * 60000) ts = null;
+    const sig = `${t.lastValTS}|${t.lat}|${t.lon}|${t.velocity}`;
+    if (!st) {
+      st = { id, route, sDisp: 0, vDisp: v, alpha: firstPollDone ? 0 : 1, pinged: new Set(), sig: null };
       trains.set(id, st);
     }
-    // The model won't carry a train past the next stop it hasn't reached yet; it eases in and waits
-    const nextIdx = knownStops.findIndex(s => s.status === 'Enroute');
-    st.capS = nextIdx >= 0 ? route.stopS[nextIdx] : route.total;
+    MODEL.report(st, { sig, s: loc.s, ts: ts ?? fetchedAt, v });
+    st.capS = MODEL.nextStop(route.stopS, knownStops.findIndex(s => s.status === 'Enroute'), st.sMeas, route.total);
+    if (!st.placed) { // first sighting: start where the train should be by now
+      st.placed = true; st.sDisp = MODEL.target(st, Date.now()); st.vDisp = v; markPassed(st);
+    }
     const late = lateness(t);
-    Object.assign(st, { sMeas: loc.s, tMeas: ts, vMeas: v, info: t, late, tier: tier(late), consist: consistFor(t.routeName || ''), gone: false });
+    Object.assign(st, { info: t, late, tier: tier(late), consist: consistFor(t.routeName || ''), gone: false });
     seen.add(id);
   }
   for (const st of trains.values()) if (!seen.has(st.id)) st.gone = true;
@@ -464,24 +471,62 @@ setInterval(updateCount, 5000);
 // folded in as a gentle speed change rather than a jump, so motion stays continuous.
 const tmpA = [0, 0], tmpB = [0, 0];
 const pings = [];
+/*MODEL*/
+// Pure motion model (no page state), so it can be tested on its own
+const MODEL = {
+  EXTRAP_S: 900,   // keep moving a train from its last report for up to 15 min
+  // Take a report. Returns false when it's the same report as last time (nothing new).
+  report(st, r) {
+    if (st.sig === r.sig) return false;
+    st.sig = r.sig; st.sMeas = r.s; st.tMeas = r.ts; st.vMeas = r.v;
+    if (st.capS == null) st.capS = Infinity;
+    return true;
+  },
+  // The next stop the train hasn't reached. Station status in the feed can lag behind the
+  // position, so a stop the reported position has already passed doesn't count.
+  nextStop(stopS, nextIdx, sMeas, total) {
+    if (nextIdx < 0) return total;
+    for (let k = Math.max(1, nextIdx); k < stopS.length; k++) if (stopS[k] > sMeas + 0.25) return stopS[k];
+    return total;
+  },
+  // Where the train should be now: carried on from its report at the reported speed, but not past
+  // the next stop it hasn't reached yet
+  target(st, now) {
+    const age = Math.min(MODEL.EXTRAP_S, Math.max(0, (now - st.tMeas) / 1000));
+    const free = Math.min(st.route.total, st.sMeas + st.vMeas * age), hold = Math.max(st.capS, st.sMeas);
+    return free > hold ? hold : free;
+  },
+  // Move the drawn train toward the target smoothly: matching the reported speed, folding small
+  // corrections in, braking into stops and never running backwards
+  step(st, dt, now) {
+    const target = MODEL.target(st, now), hold = Math.max(st.capS, st.sMeas);
+    const capped = target === hold && hold < st.route.total;
+    const err = target - st.sDisp, v = st.vMeas, stopped = v < 0.0005; // under ~1 mph
+    // Too far off to glide without looking wrong: jump. Slightly ahead of the report, it waits instead.
+    if (err > (stopped ? 0.4 : Math.max(3, v * 60)) || err < -Math.max(4, v * 120)) { st.sDisp = target; st.vDisp = capped ? 0 : v; return 'snap'; }
+    let want;
+    if (stopped) { // reported stopped: settle into place within a few seconds, then hold still
+      if (Math.abs(err) < 0.003) { st.sDisp = Math.max(st.sDisp, target); st.vDisp = 0; return 'glide'; }
+      want = Math.min(0.06, Math.max(0.01, err / 3));
+    }
+    else want = Math.min((capped ? 0 : v) + err / 25, v + 0.015); // catching up never runs far above the train's own speed
+    const brake = Math.sqrt(2 * 0.0006 * Math.max(0, hold - st.sDisp)); // ~0.6 m/s², like a real station stop
+    const braking = want > brake; if (braking) want = brake;
+    want = Math.max(0, want);
+    st.vDisp += (want - st.vDisp) * Math.min(1, dt * (braking || stopped ? 4 : 0.8));
+    let next = st.sDisp + st.vDisp * dt;
+    if (stopped && next > target) { next = Math.max(st.sDisp, target); st.vDisp = 0; } // don't coast past it
+    st.sDisp = Math.max(0, Math.min(st.route.total, next));
+    return 'glide';
+  },
+};
+/*END MODEL*/
 function stepTrains(dt) {
   const now = Date.now();
   for (const [id, t] of trains) {
     t.alpha = t.gone ? Math.max(0, t.alpha - dt / 2) : Math.min(1, t.alpha + dt / 1.5);
     if (t.gone && t.alpha <= 0) { trains.delete(id); continue; }
-    const age = Math.min(240, Math.max(0, (now - t.tMeas) / 1000));
-    const free = Math.min(t.route.total, t.sMeas + t.vMeas * age), hold = Math.max(t.capS, t.sMeas);
-    const capped = free > hold, target = capped ? hold : free;
-    const err = target - t.sDisp;
-    if (err > 40 || err < -8) { t.sDisp = target; t.vDisp = t.vMeas; markPassed(t); continue; }
-    let want = (capped ? 0 : t.vMeas) + err / 25;
-    if (capped) want = Math.min(want, Math.max(t.vMeas, 0.01) * 1.2);
-    // Brake into the next stop (about 0.6 m/s², like a real station stop) instead of overrunning it
-    const brake = Math.sqrt(2 * 0.0006 * Math.max(0, hold - t.sDisp));
-    const braking = want > brake; if (braking) want = brake;
-    want = Math.max(0, want);                      // never run backwards: ahead of the report, it waits
-    t.vDisp += (want - t.vDisp) * Math.min(1, dt * (braking ? 4 : 0.8));
-    t.sDisp = Math.max(0, Math.min(t.route.total, t.sDisp + t.vDisp * dt));
+    if (MODEL.step(t, dt, now) === 'snap') { markPassed(t); continue; }
     // Arrival ping when the drawn train reaches a stop
     const stopS = t.route.stopS;
     for (let k = 1; k < stopS.length; k++) {
@@ -771,6 +816,10 @@ function fmtTime(iso, tz) {
     return f.format(t);
   } catch (_) { return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
 }
+function ago(ts) {
+  const m = Math.round((Date.now() - ts) / 60000);
+  return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : `${Math.floor(m / 60)} hr ${m % 60} min ago`;
+}
 function trainFacts(t) {
   const i = t.info, next = i.stations.find(s => s.status === 'Enroute'), at = i.stations.find(s => s.status === 'Station');
   const late = t.late, lateTxt = late >= 60 ? `${Math.floor(late / 60)} hr ${late % 60} min late` : late >= 1 ? `${late} min late` : late <= -1 ? `${-late} min early` : 'On time';
@@ -782,6 +831,7 @@ function trainFacts(t) {
     at ? row('Now at', placeName(at.name, at.code)) : row('Next stop', next ? placeName(next.name, next.code) : 'Arriving'),
     ...(!at && next ? [row('Due', fmtTime(next.arr || next.dep, next.tz))] : []),
     row('Status', lateTxt, 'd'),
+    row('Position report', ago(t.tMeas)),
     row('Cars (est.)', String(t.consist.n)),
   ];
   return { title, rows, row };
