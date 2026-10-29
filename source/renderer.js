@@ -55,7 +55,7 @@ function rendererMain() {
       coast: lineLayer(D('coast')), borders: lineLayer(D('borders')),
       roadsMajor: lineLayer(D('roadsMajor')), roadsMinor: lineLayer(D('roadsMinor')),
       riversMajor: lineLayer(D('riversMajor')), riversMinor: lineLayer(D('riversMinor')),
-      track: lineLayer(g.edges.map(e => dec(e[2], Q))),
+      track: Object.assign(lineLayer(m.track), { all: polyPath(m.trackFar, false) }), // chunks for close zooms, light copy for far
     };
     dots = m.dots;
     // Tile decoders: two workers, or inline when nested workers aren't available

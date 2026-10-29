@@ -71,9 +71,38 @@ function inUS(x, y) {
 }
 
 // Track graph
-const nodes = GEO.nodes.map(([x, y]) => [x * Q, y * Q]);
+const QT = GEO.qt; // the track network is stored at finer precision than the background layers
+const decT = (arr) => { const out = new Float32Array(arr.length); let x = 0, y = 0; for (let i = 0; i < arr.length; i += 2) { x += arr[i]; y += arr[i + 1]; out[i] = x * QT; out[i + 1] = y * QT; } return out; };
+// Smooth a track polyline into curves: a centripetal Catmull–Rom spline through every surveyed point
+// (so it stays on the data where the data is good), subdivided only where the line bends, about
+// one point per 2.5° of turn and no closer than 15 m. Ends are kept exactly, so pieces still join at stations and junctions.
+function smoothLine(p) {
+  const n = p.length / 2; if (n < 3) return p;
+  const out = [p[0], p[1]], P = (i) => [p[2 * Math.max(0, Math.min(n - 1, i))], p[2 * Math.max(0, Math.min(n - 1, i)) + 1]];
+  const turn = (a, b, c) => { const ux = b[0] - a[0], uy = b[1] - a[1], vx = c[0] - b[0], vy = c[1] - b[1]; return Math.abs(Math.atan2(ux * vy - uy * vx, ux * vx + uy * vy)); };
+  for (let i = 0; i < n - 1; i++) {
+    const p1 = P(i), p2 = P(i + 1);
+    let p0 = P(i - 1), p3 = P(i + 2);
+    if (i === 0) p0 = [2 * p1[0] - p2[0], 2 * p1[1] - p2[1]];
+    if (i + 2 >= n) p3 = [2 * p2[0] - p1[0], 2 * p2[1] - p1[1]];
+    const bend = Math.max(i > 0 ? turn(p0, p1, p2) : 0, i + 2 < n ? turn(p1, p2, p3) : 0), len = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+    const k = bend < 0.05 || len < 0.015 || bend > 1.2 ? 1 : Math.min(10, Math.ceil(bend / 0.045), Math.max(1, Math.floor(len / 0.015)));
+    if (k > 1) {
+      const d = (a, b) => Math.sqrt(Math.hypot(b[0] - a[0], b[1] - a[1])) || 1e-6;
+      const t0 = 0, t1 = t0 + d(p0, p1), t2 = t1 + d(p1, p2), t3 = t2 + d(p2, p3);
+      for (let j = 1; j < k; j++) {
+        const t = t1 + (t2 - t1) * j / k, L = (a, b, ta, tb) => [(tb - t) / (tb - ta) * a[0] + (t - ta) / (tb - ta) * b[0], (tb - t) / (tb - ta) * a[1] + (t - ta) / (tb - ta) * b[1]];
+        const A1 = L(p0, p1, t0, t1), A2 = L(p1, p2, t1, t2), A3 = L(p2, p3, t2, t3), B1 = L(A1, A2, t0, t2), B2 = L(A2, A3, t1, t3), Cc = L(B1, B2, t1, t2);
+        out.push(Cc[0], Cc[1]);
+      }
+    }
+    out.push(p2[0], p2[1]);
+  }
+  return Float32Array.from(out);
+}
+const nodes = GEO.nodes.map(([x, y]) => [x * QT, y * QT]);
 const edges = GEO.edges.map(([a, b, d, w]) => {
-  const pts = dec(d); let len = 0;
+  const pts = smoothLine(decT(d)); let len = 0;
   for (let i = 2; i < pts.length; i += 2) len += Math.hypot(pts[i] - pts[i - 2], pts[i + 1] - pts[i - 1]);
   return { a, b, pts, len: len * (w || 1) }; // w > 1: supplementary track, used only where needed
 });
@@ -82,7 +111,7 @@ edges.forEach((e, i) => { adj[e.a].push(i, e.b); adj[e.b].push(i, e.a); });
 
 // Stations: code -> {node, x, y}; node -1 means off the embedded network
 const stations = {};
-for (const [code, [node, x, y]] of Object.entries(GEO.stations)) stations[code] = { node, x: x * Q, y: y * Q };
+for (const [code, [node, x, y]] of Object.entries(GEO.stations)) stations[code] = { node, x: x * QT, y: y * QT };
 const ST_ABBR = { Alabama: 'AL', Arizona: 'AZ', Arkansas: 'AR', California: 'CA', Colorado: 'CO', Connecticut: 'CT', Delaware: 'DE', 'District of Columbia': 'DC', Florida: 'FL', Georgia: 'GA', Idaho: 'ID', Illinois: 'IL', Indiana: 'IN', Iowa: 'IA', Kansas: 'KS', Kentucky: 'KY', Louisiana: 'LA', Maine: 'ME', Maryland: 'MD', Massachusetts: 'MA', Michigan: 'MI', Minnesota: 'MN', Mississippi: 'MS', Missouri: 'MO', Montana: 'MT', Nebraska: 'NE', Nevada: 'NV', 'New Hampshire': 'NH', 'New Jersey': 'NJ', 'New Mexico': 'NM', 'New York': 'NY', 'North Carolina': 'NC', 'North Dakota': 'ND', Ohio: 'OH', Oklahoma: 'OK', Oregon: 'OR', Pennsylvania: 'PA', 'Rhode Island': 'RI', 'South Carolina': 'SC', 'South Dakota': 'SD', Tennessee: 'TN', Texas: 'TX', Utah: 'UT', Vermont: 'VT', Virginia: 'VA', Washington: 'WA', 'West Virginia': 'WV', Wisconsin: 'WI', Wyoming: 'WY' };
 // State initials per station code, for labels like "Philadelphia 30th Street, PA"
 const stState = {};
@@ -516,6 +545,8 @@ function startRenderer() {
     type: 'init', geo: GEO, tileURL, tileSrc, MARGIN, DEM_URL, VEC_TILEJSON,
     COL: rendererColors(),
     dots: stationDots.flatMap(d => [d.x, d.y]),
+    track: edges.map(e => e.pts), // the same smoothed lines the trains run on
+    trackFar: edges.map(e => Float32Array.from(simplify(e.pts, 0.04))), // a lighter copy for zoomed-out views
   };
   const onMsg = (ev) => {
     const m = ev.data;
@@ -907,7 +938,14 @@ function routeScreen(r, sa, sb) {
   let n = 0;
   const put = (x, y) => { if (n < trailPts.length - 2) { trailPts[n++] = (x - view.x) * view.s + W / 2; trailPts[n++] = (y - view.y) * view.s + H / 2; } };
   pointAt(r, sa, tmpA); put(tmpA[0], tmpA[1]);
-  for (let i = seg(r, sa) + 1; i < r.xs.length && r.cum[i] < sb; i++) put(r.xs[i], r.ys[i]);
+  // Skip route points closer than ~1.5 px on screen (zoomed out, a trail spans hundreds of them),
+  // jumping ahead by binary search rather than visiting each one
+  const step = 1.5 / view.s;
+  for (let i = seg(r, sa) + 1; i < r.xs.length && r.cum[i] < sb;) {
+    put(r.xs[i], r.ys[i]);
+    const next = r.cum[i] + step;
+    i = i + 1 < r.cum.length && r.cum[i + 1] < next ? Math.max(i + 1, seg(r, next) + 1) : i + 1;
+  }
   pointAt(r, sb, tmpA); put(tmpA[0], tmpA[1]);
   return n;
 }

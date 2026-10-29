@@ -14,7 +14,13 @@ function proj(lon, lat) {
   return [R * r * Math.sin(t), -R * (r0 - r * Math.cos(t))]; // y down
 }
 const inBox = (lon, lat) => lon > -126 && lon < -65 && lat > 23 && lat < 50.5;
-const Q = 0.05; // km per unit
+const Q = 0.05; // km per unit (background layers)
+const QT = 0.005; // km per unit for the track network, stations and graph nodes: 5 m, so curves stay smooth up close
+function encT(pts) { // track coordinates at QT
+  const out = []; let px = 0, py = 0;
+  for (const [x, y] of pts) { const qx = Math.round(x / QT), qy = Math.round(y / QT); out.push(qx - px, qy - py); px = qx; py = qy; }
+  return out;
+}
 
 function simplify(pts, tol) {
   if (pts.length < 3) return pts;
@@ -163,7 +169,7 @@ for (const f of st.features) {
   const best = bestFra.d <= SNAP_KM ? bestFra : bestAny; // FRA track first; supplementary only if none is near
   const code = f.properties.STNCODE;
   stationNames[code] = f.properties.STNNAME;
-  if (best.d > SNAP_KM) { stations[code] = [-1, Math.round(P[0] / Q), Math.round(P[1] / Q)]; continue; }
+  if (best.d > SNAP_KM) { stations[code] = [-1, Math.round(P[0] / QT), Math.round(P[1] / QT)]; continue; }
   const e = E[best.ei], p = e[2];
   let id;
   const first = Math.hypot(best.x - p[0][0], best.y - p[0][1]) < 0.05, last = Math.hypot(best.x - p[p.length-1][0], best.y - p[p.length-1][1]) < 0.05;
@@ -173,7 +179,7 @@ for (const f of st.features) {
     const A = p.slice(0, best.i + 1).concat([[best.x, best.y]]), B = [[best.x, best.y]].concat(p.slice(best.i + 1));
     E[best.ei] = [e[0], id, A, e[3]]; E.push([id, e[1], B, e[3]]);
   }
-  stations[code] = [id, Math.round(nodes[id][0] / Q), Math.round(nodes[id][1] / Q)];
+  stations[code] = [id, Math.round(nodes[id][0] / QT), Math.round(nodes[id][1] / QT)];
 }
 // Bridge gaps in the source data: dead ends that stop just short of other track (common at
 // junctions, river crossings and terminal approaches) are joined with a short connector, so routes
@@ -223,8 +229,9 @@ for (const f of st.features) {
   }
   console.log(`gap bridging: ${dead.length} dead ends, ${nPair} joined in pairs, ${nEdge} joined to nearby track`);
 }
-const edgeOut = E.map(([a, b, pts, w]) => w === 1 ? [a, b, enc(simplify(pts, 0.06))] : [a, b, enc(simplify(pts, 0.06)), w]);
-const nodeOut = nodes.map(([x, y]) => [Math.round(x / Q), Math.round(y / Q)]);
+// Only points that add less than 3 m of shape are dropped; the page smooths the rest into curves
+const edgeOut = E.map(([a, b, pts, w]) => w === 1 ? [a, b, encT(simplify(pts, 0.003))] : [a, b, encT(simplify(pts, 0.003)), w]);
+const nodeOut = nodes.map(([x, y]) => [Math.round(x / QT), Math.round(y / QT)]);
 // connectivity report
 const g = nodes.map(() => []); E.forEach(([a, b]) => { g[a].push(b); g[b].push(a); });
 const comp = new Int32Array(nodes.length).fill(-1); let nc = 0; const sizes = [];
@@ -250,7 +257,7 @@ for (const f of [...readNE('ne_10m_lakes'), ...readNE('ne_10m_lakes_north_americ
 }
 
 const data = {
-  q: Q,
+  q: Q, qt: QT,
   land: lines(land.coordinates.flat(), 0.4, false),
   coast: lines(coast.coordinates, 0.3, false),
   borders: lines(borders.coordinates, 0.4, false),
