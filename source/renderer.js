@@ -247,9 +247,12 @@ function rendererMain() {
   function checkPreload() {
     const done = preloadList.filter(e => e.state === 'ready' || e.state === 'error').length;
     self.postMessage({ type: 'progress', done, total: preloadList.length });
-    if (done === preloadList.length && preloading) { preloading = false; requestRender(0); }
+    if (done === preloadList.length && preloading) { preloading = false; requestRender(0); setTimeout(renderOverview, 1500); } // after the first view
   }
 
+  // A whole-country image, painted once (and again on a theme change). The page keeps it under
+  // everything, so a fast zoom or pan past the newest image shows a softer map instead of empty ground.
+  function renderOverview() { if (L) render({ x: -50, y: -50, s: 0.42, W: 1975, H: 1260, dpr: 1, interactive: true, overview: true, seq: -1 }); }
   function prefetch(m) { // tiles ahead of a followed train, so following never outruns the detail
     if (!view) return;
     const kmPer = Math.cos(unproj(view.x, view.y)[1] * rad), s = view.s;
@@ -399,8 +402,8 @@ function rendererMain() {
     let bmp;
     if (canvas.transferToImageBitmap) bmp = canvas.transferToImageBitmap();
     else { bmp = mk(cw, chh); bmp.getContext('2d').drawImage(canvas, 0, 0); }
-    const msg = { type: 'frame', bmp, x: vx, y: vy, s, BW, BH, dpr, seq: v.seq, settled: !v.interactive, preloading };
-    lastPosted = { x: vx, y: vy, s, BW, BH };
+    const msg = { type: v.overview ? 'overview' : 'frame', bmp, x: vx, y: vy, s, BW, BH, dpr, seq: v.seq, settled: !v.interactive, preloading };
+    if (!v.overview) lastPosted = { x: vx, y: vy, s, BW, BH };
     try { self.postMessage(msg, canvas.transferToImageBitmap ? [bmp] : []); } catch (_) { self.postMessage(msg); }
   }
   function clipSeg(ax, ay, bx, by, x0, y0, x1, y1) {
@@ -425,6 +428,6 @@ function rendererMain() {
     if (m.type === 'init') init(m);
     else if (m.type === 'view') { view = m; if (m.render) requestRender(0); }
     else if (m.type === 'prefetch') prefetch(m);
-    else if (m.type === 'theme') { COL = m.COL; requestRender(0); }
+    else if (m.type === 'theme') { COL = m.COL; requestRender(0); if (!preloading) setTimeout(renderOverview, 600); }
   };
 }

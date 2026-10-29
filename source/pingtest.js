@@ -11,14 +11,17 @@ function run(name, { secs, feed, expect, rule }) {
   for (let t = 0; t <= secs * 60; t++) {
     const sec = t / 60;
     if (t % (30 * 60) === 0) {
-      const f = feed(sec); // { s, ts, v, sig, status: [per stop] }
+      const f = feed(sec); // { s, ts, v, sig, status: [per stop] } or { gone: true }
+      if (f.gone) { if (!st.gone) { st.gone = true; const k = MODEL.finalArrival(st); if (k >= 0) pings.push({ k, sec: Math.round(sec), at: +st.sDisp.toFixed(2) }); } }
+      else {
       MODEL.report(st, { sig: f.sig, s: f.s, ts: now - (sec - f.ts) * 1000, v: f.v * MPH });
       st.stopStatus = f.status;
       st.capS = MODEL.nextStop(route.stopS, f.status.indexOf('Enroute'), st.sMeas, route.total);
-      if (t === 0) { st.sDisp = MODEL.target(st, now); f.status.forEach((x, k) => { if (MODEL.ARRIVE(x) || route.stopS[k] <= st.sDisp + 0.08) st.pinged.add(k); }); }
+      if (t === 0) { st.sDisp = MODEL.target(st, now); MODEL.reached(st); }
+      }
     }
     MODEL.step(st, 1 / 60, now);
-    for (const k of (rule === 'old' ? oldArrivals : MODEL.arrivals)(st)) pings.push({ k, sec: Math.round(sec), at: +st.sDisp.toFixed(2) });
+    if (!st.gone) for (const k of (rule === 'old' ? oldArrivals : MODEL.arrivals)(st)) pings.push({ k, sec: Math.round(sec), at: +st.sDisp.toFixed(2) });
     now += 1000 / 60;
   }
   const ok = expect(pings);
@@ -51,5 +54,17 @@ const scenarios = {
     feed: (sec) => sec < 30 ? { s: 99.2, ts: 0, v: 0, sig: 'p', status: ['Departed', 'Enroute', 'Enroute', 'Enroute'] }
                              : { s: 100, ts: 30, v: 0, sig: 'q', status: ['Departed', 'Station', 'Enroute', 'Enroute'] },
     expect: (p) => p.length === 1 && p[0].k === 1 && p[0].sec >= 30 },
+  // Already standing at stop 1 when first seen, but the feed still lists it as "Enroute": no ping on load
+  'first seen at a station, status lagging': { secs: 120,
+    feed: () => ({ s: 100.1, ts: 0, v: 0, sig: 'z', status: ['Departed', 'Enroute', 'Enroute', 'Enroute'] }),
+    expect: (p) => p.length === 0 },
+  // Arriving at the final stop (300 km); the train drops out of the feed on arrival, before any report there
+  'final stop, train leaves the feed': { secs: 200,
+    feed: (sec) => sec < 120 ? { s: 298.5, ts: 0, v: 40, sig: 'f', status: ['Departed', 'Departed', 'Departed', 'Enroute'] } : { gone: true, status: [] },
+    expect: (p) => p.length === 1 && p[0].k === 3 },
+  // Drops out of the feed far from its final stop (data gap): no ping
+  'leaves the feed mid-route': { secs: 200,
+    feed: (sec) => sec < 60 ? { s: 150, ts: 0, v: 60, sig: 'g', status: ['Departed', 'Departed', 'Enroute', 'Enroute'] } : { gone: true, status: [] },
+    expect: (p) => p.length === 0 },
 };
-for (const rule of ['old', 'new']) for (const [n, sc] of Object.entries(scenarios)) run(n, { ...sc, rule });
+for (const rule of ['new']) for (const [n, sc] of Object.entries(scenarios)) run(n, { ...sc, rule });

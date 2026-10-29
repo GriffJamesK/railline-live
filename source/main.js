@@ -243,8 +243,7 @@ function ingest(data, fetchedAt) {
     if (st && st.route !== route) { // same train, rebuilt route (e.g. more stations became known): keep its place
       pointAt(st.route, st.sDisp, tmpA);
       st.sDisp = locate(route, tmpA[0], tmpA[1], null).s; st.route = route; st.sig = null;
-      st.pinged = new Set(); markPassed(st);
-      (st.stopStatus || []).forEach((x, k) => { if (MODEL.ARRIVE(x)) st.pinged.add(k); });
+      st.pinged = new Set(); MODEL.reached(st);
     }
     const loc = locate(route, x, y, st ? st.sDisp : null);
     if (loc.d > 60) continue; // position nowhere near its scheduled route
@@ -262,14 +261,17 @@ function ingest(data, fetchedAt) {
     st.capS = MODEL.nextStop(route.stopS, knownStops.findIndex(s => s.status === 'Enroute'), st.sMeas, route.total);
     st.stops = knownStops; st.stopStatus = knownStops.map(s => s.status);
     if (!st.placed) { // first sighting: start where the train should be by now
-      st.placed = true; st.sDisp = MODEL.target(st, Date.now()); st.vDisp = v; markPassed(st);
-      st.stopStatus.forEach((x, k) => { if (MODEL.ARRIVE(x)) st.pinged.add(k); });
+      st.placed = true; st.sDisp = MODEL.target(st, Date.now()); st.vDisp = v; MODEL.reached(st);
     }
     const late = lateness(t);
     Object.assign(st, { info: t, late, tier: tier(late), consist: consistFor(t.routeName || ''), gone: false });
     seen.add(id);
   }
-  for (const st of trains.values()) if (!seen.has(st.id)) st.gone = true;
+  for (const st of trains.values()) if (!seen.has(st.id) && !st.gone) {
+    st.gone = true;
+    const k = MODEL.finalArrival(st);
+    if (k >= 0) { pointAt(st.route, st.route.stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[st.tier] }); logArrival(st, k); announce(st, k); }
+  }
   if (missing.size) fetchMissingStations([...missing]);
 }
 
@@ -355,6 +357,22 @@ const MODEL = {
   },
 };
 MODEL.ARRIVE = (status) => status === 'Station' || status === 'Departed';
+// The latest report has the train stopped within 500 m of stop k (long platforms and terminals
+// put the reported position a few hundred metres from the station's point on the track)
+MODEL.stoppedAt = (st, k) => st.vMeas < 0.0005 && Math.abs(st.sMeas - st.route.stopS[k]) < 0.5;
+// Stops already reached when a train first appears (or its route is rebuilt): never pinged
+MODEL.reached = (st) => {
+  const stopS = st.route.stopS, status = st.stopStatus || [];
+  for (let k = 0; k < stopS.length; k++) if (MODEL.ARRIVE(status[k]) || MODEL.stoppedAt(st, k) || stopS[k] <= st.sDisp + 0.08) st.pinged.add(k);
+};
+// A train that leaves the feed at its final stop usually does so right as it arrives, before the
+// feed reports it there. If its last report was within 3 km of the final stop, that's the arrival.
+MODEL.finalArrival = (st) => {
+  const k = st.route.stopS.length - 1;
+  if (st.pinged.has(k) || !(st.route.stopS[k] - st.sMeas < 3)) return -1;
+  st.pinged.add(k);
+  return k;
+};
 // Stops to ping now. A ping needs the feed to confirm the train reached the stop (its status is
 // "Station" or "Departed", or its position report has it stopped at the stop), and fires when the
 // drawn train is at the stop, so it lines up on screen.
@@ -364,7 +382,7 @@ MODEL.arrivals = (st) => {
   for (let k = 1; k < stopS.length; k++) {
     if (st.pinged.has(k)) continue;
     // Evidence of arrival: the feed's status for the stop, or a report of the train stopped right at it
-    const stoppedThere = st.vMeas < 0.0005 && Math.abs(st.sMeas - stopS[k]) < 0.3;
+    const stoppedThere = MODEL.stoppedAt(st, k);
     if (!MODEL.ARRIVE(status[k]) && !stoppedThere) continue;
     const d = st.sDisp - stopS[k];
     if (d > 0.5) { st.pinged.add(k); continue; }
@@ -407,15 +425,23 @@ function renderDebug() {
   })));
 }
 // Arrival announcements: a quiet line in the top-right corner that fades after a few seconds
+// Arrivals confirmed by the same feed update are announced one at a time, ~1.5 s apart
+const toastQueue = []; let toastTimer = null;
 function announce(t, k) {
-  const box = $('toasts'), s = t.stops && t.stops[k], i = t.info; if (!box || !s) return;
-  const el = document.createElement('div');
-  el.textContent = `${i.routeName || 'Train'} ${i.trainNum} arrived at ${placeName(s.name, s.code)}`;
+  const s = t.stops && t.stops[k], i = t.info; if (!s) return;
+  toastQueue.push(`${i.routeName || 'Train'} ${i.trainNum} arrived at ${placeName(s.name, s.code)}`);
+  if (toastQueue.length > 8) toastQueue.shift();
+  if (!toastTimer) showToast();
+}
+function showToast() {
+  const box = $('toasts'), text = toastQueue.shift();
+  if (!box || !text) { toastTimer = null; return; }
+  const el = document.createElement('div'); el.textContent = text;
   el.addEventListener('animationend', () => el.remove());
   box.prepend(el);
   while (box.children.length > 4) box.lastElementChild.remove();
+  toastTimer = setTimeout(showToast, 1500);
 }
-function markPassed(t) { t.route.stopS.forEach((ss, k) => { if (ss <= t.sDisp + 0.08) t.pinged.add(k); }); }
 
 // ---------- view ----------
 const canvas = $('map'), ctx = canvas.getContext('2d', { alpha: false });
@@ -481,7 +507,7 @@ function applyZoom(k) {
 
 // ---------- base map (painted by the renderer, composited here) ----------
 const base = {
-  worker: null, frames: [], sent: null, seq: 0, force: true, interactiveSent: false,
+  worker: null, frames: [], overview: null, sent: null, seq: 0, force: true, interactiveSent: false,
 };
 function startRenderer() {
   const tileSrc = '(' + tileWorker.toString() + ')()';
@@ -494,11 +520,11 @@ function startRenderer() {
   const onMsg = (ev) => {
     const m = ev.data;
     if (m.type === 'frame') {
-      m.t0 = performance.now(); base.frames.push(m);
-      while (base.frames.length > 4) closeFrame(base.frames.shift());
+      m.t0 = performance.now(); base.frames.push(m); trimFrames();
       if (m.settled && !m.preloading) loading.mapReady = true;
       loading.step();
-    } else if (m.type === 'progress') { loading.tiles = m; loading.step(); }
+    } else if (m.type === 'overview') { if (base.overview) closeFrame(base.overview); base.overview = m; }
+    else if (m.type === 'progress') { loading.tiles = m; loading.step(); }
   };
   // Prefer a worker that can draw off the page; fall back to drawing on the page
   const canWorkerDraw = typeof OffscreenCanvas !== 'undefined' && 'transferToImageBitmap' in OffscreenCanvas.prototype && typeof Worker !== 'undefined';
@@ -522,7 +548,8 @@ function requestBase(now) {
   const interactive = goal.active || !!drag || !!pinch || now - lastViewChange < 160;
   // During an animated zoom, paint where the zoom is headed: the result is ready on arrival, and
   // when zooming out it already covers the screen while the animation plays
-  let tv = goal.active && !follow ? { s: goal.s, x: goal.ax - (goal.sx - W / 2) / goal.s, y: goal.ay - (goal.sy - H / 2) / goal.s } : view;
+  let tv = !goal.active ? view : follow ? { s: goal.s, x: view.x, y: view.y } // following: the zoom is centered on the train
+    : { s: goal.s, x: goal.ax - (goal.sx - W / 2) / goal.s, y: goal.ay - (goal.sy - H / 2) / goal.s };
   if (flight) { pointAt(flight.t.route, flight.t.sDisp, tmpB); tv = { s: flight.s1, x: tmpB[0], y: tmpB[1] }; } // paint where the flight ends
   const r = base.sent;
   let need = base.force || !r;
@@ -546,15 +573,30 @@ const FADE_MS = reduceMotion ? 0 : 260;
 const closeFrame = (f) => { if (f.bmp.close) f.bmp.close(); };
 const frameAlpha = (f, i, now) => i === 0 || !FADE_MS ? 1 : Math.min(1, (now - f.t0) / FADE_MS);
 function coversScreen(f) { const r = baseRect(f); return r[0] <= 0.5 && r[1] <= 0.5 && r[0] + r[2] >= W - 0.5 && r[1] + r[3] >= H - 0.5; }
+// Keep at most 4 images, but never drop the newest one that still fills the screen: during a fast
+// zoom it's what shows around the newer, smaller images until they cover everything
+function trimFrames() {
+  const fr = base.frames;
+  while (fr.length > 4) {
+    let keep = -1; for (let i = fr.length - 2; i >= 0; i--) if (coversScreen(fr[i])) { keep = i; break; }
+    closeFrame(fr.splice(keep === 0 ? 1 : 0, 1)[0]);
+  }
+}
 function drawBase(now) {
   const fr = base.frames;
   for (let i = fr.length - 1; i > 0; i--) {
     if (frameAlpha(fr[i], i, now) >= 1 && coversScreen(fr[i])) { fr.splice(0, i).forEach(closeFrame); break; }
   }
-  if (!fr.length || !coversScreen(fr[0])) { ctx.fillStyle = COL.ground; ctx.fillRect(0, 0, canvas.width, canvas.height); }
-  for (let i = 0; i < fr.length; i++) {
+  // Draw from the newest image that fills the screen on its own (older ones are hidden under it)
+  let start = 0;
+  for (let i = fr.length - 1; i > 0; i--) if (coversScreen(fr[i])) { start = i; break; }
+  if (!fr.length || !coversScreen(fr[start])) {
+    ctx.fillStyle = COL.ground; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (base.overview) { const r = baseRect(base.overview); ctx.drawImage(base.overview.bmp, r[0] * DPR, r[1] * DPR, r[2] * DPR, r[3] * DPR); }
+  }
+  for (let i = start; i < fr.length; i++) {
     const r = baseRect(fr[i]);
-    ctx.globalAlpha = frameAlpha(fr[i], i, now);
+    ctx.globalAlpha = i === start ? 1 : frameAlpha(fr[i], i, now);
     ctx.drawImage(fr[i].bmp, r[0] * DPR, r[1] * DPR, r[2] * DPR, r[3] * DPR);
   }
   ctx.globalAlpha = 1;
