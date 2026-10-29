@@ -1,4 +1,4 @@
-# Railline Live
+# Rail Live
 
 A live map of Amtrak trains across the United States. Train positions come from the
 [Amtraker](https://amtraker.com) feed (a public decoder of Amtrak's Track Your Train data) and
