@@ -1,0 +1,1245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Railline Live</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: full-bleed canvas map, one quiet status card top-left, zoom controls bottom-right. */
+:root {
+  --ground: #15181b;   /* water and everything outside the US */
+  --land: #1f2327;
+  --ink: #e4eef0;
+  --ink-dim: #8d9aa1;
+  --accent: #63c5bf;   /* on-time trains, trails */
+  --late: #e3a86b;     /* trains running 15+ minutes late */
+  --very-late: #e2727c; /* trains running an hour or more late */
+  --panel: rgba(30, 35, 39, 0.82);
+  --hair: rgba(150, 175, 185, 0.16);
+  --font-ui: "Barlow", "Helvetica Neue", Arial, sans-serif;
+  --font-data: "JetBrains Mono", ui-monospace, Menlo, monospace;
+  color-scheme: dark;
+}
+html, body { height: 100%; margin: 0; }
+[hidden] { display: none !important; }
+body { background: var(--ground); color: var(--ink); font: 14px/1.4 var(--font-ui); overflow: hidden; }
+canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; }
+canvas.dragging { cursor: grabbing; }
+canvas.over-train { cursor: pointer; }
+
+.card {
+  position: fixed; background: var(--panel); border: 1px solid var(--hair); border-radius: 10px;
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+}
+#status {
+  top: calc(16px + env(safe-area-inset-top, 0px)); left: max(16px, env(safe-area-inset-left, 0px));
+  padding: 12px 14px; display: grid; gap: 8px; min-width: 210px; max-width: calc(100vw - 32px);
+}
+#status h1 { margin: 0; font-size: 15px; font-weight: 600; letter-spacing: 0.02em; display: flex; align-items: baseline; gap: 8px; }
+#status h1 span { color: var(--ink-dim); font-weight: 400; }
+.live { display: flex; align-items: center; gap: 8px; font: 12px var(--font-data); color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 0 var(--accent); animation: pulse 2.4s infinite; flex: none; }
+.dot.err { background: var(--late); animation: none; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(99,197,191,.5); } 70% { box-shadow: 0 0 0 7px rgba(99,197,191,0); } 100% { box-shadow: 0 0 0 0 rgba(99,197,191,0); } }
+.legend { display: flex; gap: 14px; font-size: 12px; color: var(--ink-dim); }
+.legend i { display: inline-block; width: 14px; height: 6px; border-radius: 3px; margin-right: 6px; vertical-align: 1px; }
+#msg { font-size: 12px; color: var(--late); max-width: 260px; }
+
+#tip {
+  padding: 10px 12px; pointer-events: none; display: grid; gap: 4px; min-width: 190px; max-width: 260px;
+  transform: translate(14px, 14px);
+}
+.late b.d { color: var(--late); }
+.vlate b.d { color: var(--very-late); }
+.ok b.d { color: var(--accent); }
+.rows { display: grid; gap: 4px; }
+.row { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; color: var(--ink-dim); }
+.row b { font: 500 12px var(--font-data); color: var(--ink); font-variant-numeric: tabular-nums; text-align: right; }
+.ttl { font-weight: 600; font-size: 14px; }
+.ttl .n { color: var(--ink-dim); font-weight: 400; }
+
+#info {
+  left: max(16px, env(safe-area-inset-left, 0px)); bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  width: 270px; max-width: calc(100vw - 100px); padding: 12px 14px; display: grid; gap: 10px;
+}
+#info .head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+#info .eyebrow { font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-dim); }
+#info .ttl { font-size: 16px; }
+#info .route { font-size: 12px; color: var(--ink-dim); }
+.bar { height: 3px; border-radius: 2px; background: var(--hair); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+#info button { justify-self: start; background: none; border: 1px solid var(--hair); color: var(--ink); border-radius: 6px; padding: 4px 10px; font: 12px var(--font-ui); cursor: pointer; }
+#info button:hover { background: rgba(255,255,255,.05); }
+#info button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+#stip { padding: 5px 9px; pointer-events: none; font-size: 12px; white-space: nowrap; transform: translate(-50%, calc(-100% - 10px)); }
+#stip span { color: var(--ink-dim); font: 11px var(--font-data); margin-left: 6px; }
+
+#zoom {
+  right: max(16px, env(safe-area-inset-right, 0px)); bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  display: grid; overflow: hidden;
+}
+#zoom button {
+  width: 38px; height: 38px; border: 0; background: transparent; color: var(--ink); font: 400 20px var(--font-ui); cursor: pointer;
+}
+#zoom button + button { border-top: 1px solid var(--hair); }
+#zoom button:hover { background: rgba(255,255,255,.05); }
+#zoom button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.credit { position: fixed; right: max(66px, calc(env(safe-area-inset-right, 0px) + 66px)); bottom: calc(16px + env(safe-area-inset-bottom, 0px)); font-size: 11px; color: #5c686f; }
+.credit a { color: inherit; }
+.credit { max-width: calc(100vw - 380px); text-align: right; }
+@media (max-width: 520px) { .credit { display: none; } #status { min-width: 0; } #info { width: auto; right: 70px; } }
+</style>
+</head>
+<body>
+<canvas id="map" aria-label="Map of passenger trains across the United States"></canvas>
+
+<div id="status" class="card">
+  <h1>Railline <span>live</span></h1>
+  <div class="live"><span class="dot" id="dot"></span><span id="count">Connecting to train feed…</span></div>
+  <div class="legend"><span><i style="background:var(--accent)"></i>On time</span><span><i style="background:var(--late)"></i>15+ min late</span><span><i style="background:var(--very-late)"></i>1+ hr late</span></div>
+  <div id="msg" hidden></div>
+</div>
+<div id="tip" class="card" hidden></div>
+<div id="stip" class="card" hidden></div>
+<div id="info" class="card" hidden aria-live="polite">
+  <div class="head"><span class="eyebrow">Following</span><span class="eyebrow" id="infoPct"></span></div>
+  <div><div class="ttl" id="infoTitle"></div><div class="route" id="infoRoute"></div></div>
+  <div class="bar"><i id="infoBar"></i></div>
+  <div class="rows" id="infoRows"></div>
+  <button id="unfollow" type="button">Stop following</button>
+</div>
+<div id="zoom" class="card">
+  <button id="zin" type="button" aria-label="Zoom in">+</button>
+  <button id="zout" type="button" aria-label="Zoom out">−</button>
+</div>
+<div class="credit">Positions: <a href="https://amtraker.com" target="_blank" rel="noopener">Amtraker</a> · Track: FRA · Terrain: AWS Terrain Tiles · Streets: <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a>, © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> · Natural Earth</div>
+
+<script>
+/*__GEO__*/
+</script>
+<script>
+(() => {
+'use strict';
+const API = 'https://api.amtraker.com/v3';
+const POLL_MS = 30000;
+const MPH = 1.609344 / 3600; // mph -> km/s
+
+// ---------- projection (must match the build step) ----------
+const R = 6371, rad = Math.PI / 180;
+const P1 = 29.5 * rad, P2 = 45.5 * rad, L0 = -96 * rad, F0 = 37.5 * rad;
+const N = (Math.sin(P1) + Math.sin(P2)) / 2, C = Math.cos(P1) ** 2 + 2 * N * Math.sin(P1);
+const RHO0 = Math.sqrt(C - 2 * N * Math.sin(F0)) / N;
+function project(lon, lat) {
+  const t = N * (lon * rad - L0), r = Math.sqrt(C - 2 * N * Math.sin(lat * rad)) / N;
+  return [R * r * Math.sin(t), -R * (RHO0 - r * Math.cos(t))];
+}
+
+function unproject(x, y) {
+  const X = x / R, Y = -y / R, rho = Math.sign(N) * Math.hypot(X, RHO0 - Y), th = Math.atan2(X, RHO0 - Y);
+  return [(L0 + th / N) / rad, Math.asin(Math.max(-1, Math.min(1, (C - rho * rho * N * N) / (2 * N)))) / rad];
+}
+
+// ---------- decode embedded geometry ----------
+const Q = GEO.q;
+function dec(arr) {
+  const out = new Float32Array(arr.length); let x = 0, y = 0;
+  for (let i = 0; i < arr.length; i += 2) { x += arr[i]; y += arr[i + 1]; out[i] = x * Q; out[i + 1] = y * Q; }
+  return out;
+}
+function toPath(lines, close) {
+  const p = new Path2D();
+  for (const l of lines) {
+    const a = dec(l); p.moveTo(a[0], a[1]);
+    for (let i = 2; i < a.length; i += 2) p.lineTo(a[i], a[i + 1]);
+    if (close) p.closePath();
+  }
+  return p;
+}
+// A line layer keeps one whole-country path for far zooms, plus small bounded chunks so close
+// zooms only stroke what is on screen (stroking the whole country at street scale is very slow).
+const CHUNK = 40;
+function toLayer(polylines) {
+  const all = new Path2D(), chunks = [];
+  for (const a of polylines) {
+    all.moveTo(a[0], a[1]); for (let i = 2; i < a.length; i += 2) all.lineTo(a[i], a[i + 1]);
+    for (let st = 0; st < a.length - 2; st += CHUNK * 2) {
+      const end = Math.min(a.length, st + CHUNK * 2 + 2), p = new Path2D();
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let i = st; i < end; i += 2) {
+        const x = a[i], y = a[i + 1]; i === st ? p.moveTo(x, y) : p.lineTo(x, y);
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+      chunks.push({ p, a: a.subarray(st, end), x0, y0, x1, y1 });
+    }
+  }
+  return { all, chunks };
+}
+const layers = {
+  land: toPath(GEO.land, true), coast: toLayer(GEO.coast.map(dec)), borders: toLayer(GEO.borders.map(dec)),
+  roadsMajor: toLayer(GEO.roadsMajor.map(dec)), roadsMinor: toLayer(GEO.roadsMinor.map(dec)),
+  riversMajor: toLayer(GEO.riversMajor.map(dec)), riversMinor: toLayer(GEO.riversMinor.map(dec)),
+  lakes: toPath(GEO.lakes, true),
+};
+
+// Track graph
+const nodes = GEO.nodes.map(([x, y]) => [x * Q, y * Q]);
+const edges = GEO.edges.map(([a, b, d]) => {
+  const pts = dec(d); let len = 0;
+  for (let i = 2; i < pts.length; i += 2) len += Math.hypot(pts[i] - pts[i - 2], pts[i + 1] - pts[i - 1]);
+  return { a, b, pts, len };
+});
+const adj = nodes.map(() => []);
+edges.forEach((e, i) => { adj[e.a].push([i, e.b]); adj[e.b].push([i, e.a]); });
+layers.track = toLayer(edges.map(e => e.pts));
+
+// Liang–Barsky: parametric [t0, t1] of a segment inside a rectangle, or null
+function clipSeg(ax, ay, bx, by, x0, y0, x1, y1) {
+  let t0 = 0, t1 = 1; const dx = bx - ax, dy = by - ay;
+  const P = [-dx, dx, -dy, dy], Qv = [ax - x0, x1 - ax, ay - y0, y1 - ay];
+  for (let i = 0; i < 4; i++) {
+    if (P[i] === 0) { if (Qv[i] < 0) return null; continue; }
+    const r = Qv[i] / P[i];
+    if (P[i] < 0) { if (r > t1) return null; if (r > t0) t0 = r; } else { if (r < t0) return null; if (r < t1) t1 = r; }
+  }
+  return [t0, t1];
+}
+
+// US-only filter: a train is drawn only while its reported position is on US land (or within
+// a few km of the coast/border, so lakeshore and coastal running isn't dropped)
+const hitCtx = document.createElement('canvas').getContext('2d');
+const landOutline = toPath(GEO.coast);
+function inUS(x, y) {
+  if (hitCtx.isPointInPath(layers.land, x, y, 'evenodd')) return true;
+  hitCtx.lineWidth = 6; return hitCtx.isPointInStroke(landOutline, x, y);
+}
+
+// Stations: code -> {node, x, y}; node -1 means off the embedded network
+const stations = {};
+for (const [code, [node, x, y]] of Object.entries(GEO.stations)) stations[code] = { node, x: x * Q, y: y * Q };
+const ST_ABBR = { Alabama: 'AL', Arizona: 'AZ', Arkansas: 'AR', California: 'CA', Colorado: 'CO', Connecticut: 'CT', Delaware: 'DE', 'District of Columbia': 'DC', Florida: 'FL', Georgia: 'GA', Idaho: 'ID', Illinois: 'IL', Indiana: 'IN', Iowa: 'IA', Kansas: 'KS', Kentucky: 'KY', Louisiana: 'LA', Maine: 'ME', Maryland: 'MD', Massachusetts: 'MA', Michigan: 'MI', Minnesota: 'MN', Mississippi: 'MS', Missouri: 'MO', Montana: 'MT', Nebraska: 'NE', Nevada: 'NV', 'New Hampshire': 'NH', 'New Jersey': 'NJ', 'New Mexico': 'NM', 'New York': 'NY', 'North Carolina': 'NC', 'North Dakota': 'ND', Ohio: 'OH', Oklahoma: 'OK', Oregon: 'OR', Pennsylvania: 'PA', 'Rhode Island': 'RI', 'South Carolina': 'SC', 'South Dakota': 'SD', Tennessee: 'TN', Texas: 'TX', Utah: 'UT', Vermont: 'VT', Virginia: 'VA', Washington: 'WA', 'West Virginia': 'WV', Wisconsin: 'WI', Wyoming: 'WY' };
+// Stations drawn as dots: the rail stations from the embedded FRA list
+const stationDots = Object.entries(GEO.stationNames).filter(([c]) => stations[c]).map(([code, name]) => {
+  const m = name.match(/^(.*),\s*([^,]+)$/);
+  return { code, x: stations[code].x, y: stations[code].y, name: m && ST_ABBR[m[2].trim()] ? `${m[1]}, ${ST_ABBR[m[2].trim()]}` : name };
+});
+
+// ---------- routing ----------
+function dijkstra(src, dst) {
+  if (src === dst) return [];
+  const dist = new Float64Array(nodes.length).fill(Infinity), prev = new Int32Array(nodes.length).fill(-1), prevE = new Int32Array(nodes.length);
+  const heap = [[0, src]]; dist[src] = 0;
+  const push = (it) => { heap.push(it); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
+  const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
+  while (heap.length) {
+    const [d, u] = pop(); if (d > dist[u]) continue; if (u === dst) break;
+    for (const [ei, v] of adj[u]) { const nd = d + edges[ei].len; if (nd < dist[v]) { dist[v] = nd; prev[v] = u; prevE[v] = ei; push([nd, v]); } }
+  }
+  if (!isFinite(dist[dst])) return null;
+  const seq = []; for (let v = dst; v !== src; v = prev[v]) seq.push([prevE[v], prev[v]]);
+  return { steps: seq.reverse(), len: dist[dst] };
+}
+
+const routeCache = new Map();
+function buildRoute(codes) {
+  const key = codes.join('>');
+  if (routeCache.has(key)) return routeCache.get(key);
+  const xs = [], ys = [];
+  const add = (x, y) => { const n = xs.length; if (n && Math.abs(xs[n - 1] - x) < 1e-4 && Math.abs(ys[n - 1] - y) < 1e-4) return; xs.push(x); ys.push(y); };
+  const stops = [];
+  for (let i = 0; i < codes.length; i++) {
+    const s = stations[codes[i]];
+    if (i === 0) { add(s.x, s.y); stops.push(0); continue; }
+    const a = stations[codes[i - 1]], b = s;
+    const straight = Math.hypot(b.x - a.x, b.y - a.y);
+    const path = a.node >= 0 && b.node >= 0 ? dijkstra(a.node, b.node) : null;
+    if (path && path.len < straight * 2.2 + 40) {
+      for (const [ei, from] of path.steps) {
+        const p = edges[ei].pts, fwd = edges[ei].a === from;
+        if (fwd) for (let k = 0; k < p.length; k += 2) add(p[k], p[k + 1]);
+        else for (let k = p.length - 2; k >= 0; k -= 2) add(p[k], p[k + 1]);
+      }
+    }
+    add(b.x, b.y);
+    stops.push(xs.length - 1);
+  }
+  const n = xs.length, cum = new Float64Array(n);
+  for (let i = 1; i < n; i++) cum[i] = cum[i - 1] + Math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]);
+  const r = { xs: Float64Array.from(xs), ys: Float64Array.from(ys), cum, total: cum[n - 1] || 0, stopS: stops.map(i => cum[i]) };
+  routeCache.set(key, r);
+  return r;
+}
+function seg(r, s) { // index i with cum[i] <= s < cum[i+1]
+  let lo = 0, hi = r.cum.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (r.cum[m] <= s) lo = m; else hi = m; }
+  return lo;
+}
+function pointAt(r, s, out) {
+  s = Math.max(0, Math.min(r.total, s));
+  const i = seg(r, s), L = r.cum[i + 1] - r.cum[i];
+  const t = L > 0 ? (s - r.cum[i]) / L : 0;
+  out[0] = r.xs[i] + (r.xs[i + 1] - r.xs[i]) * t; out[1] = r.ys[i] + (r.ys[i + 1] - r.ys[i]) * t;
+  return out;
+}
+function locate(r, x, y, hint) { // nearest arc-length on route; prefers the window around hint
+  const scan = (lo, hi) => {
+    let best = { d: Infinity, s: 0 };
+    for (let i = lo; i < hi; i++) {
+      const ax = r.xs[i], ay = r.ys[i], dx = r.xs[i + 1] - ax, dy = r.ys[i + 1] - ay, L2 = dx * dx + dy * dy;
+      const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / L2)) : 0;
+      const d = Math.hypot(ax + dx * t - x, ay + dy * t - y);
+      if (d < best.d) best = { d, s: r.cum[i] + Math.sqrt(L2) * t };
+    }
+    return best;
+  };
+  const n = r.xs.length - 1;
+  if (hint != null) {
+    const w = scan(seg(r, Math.max(0, hint - 120)), Math.min(n, seg(r, hint + 120) + 1));
+    if (w.d < 6) return w;
+  }
+  return scan(0, n);
+}
+
+// ---------- consist estimates (cars including locomotives) ----------
+const CONSIST = [
+  [/acela/i, 8, 'both'], [/auto train/i, 28, 'double'], [/empire builder|coast starlight|lake shore|silver meteor|silver star|floridian/i, 11, 'double'],
+  [/zephyr|southwest chief|capitol limited|crescent/i, 10, 'double'], [/sunset|city of new orleans|texas eagle|cardinal/i, 8, 'double'],
+  [/northeast regional|regional/i, 8, 'cab'], [/palmetto|carolinian|keystone|pennsylvanian|vermonter|cascades|surfliner/i, 7, 'cab'],
+  [/piedmont|heartland|mardi gras|hartford|valley flyer|berkshire/i, 4, 'cab'], [/brightline/i, 7, 'both'],
+];
+function consistFor(name) {
+  for (const [re, n, kind] of CONSIST) if (re.test(name)) return { n, kind };
+  return { n: 6, kind: 'cab' };
+}
+
+// ---------- train state ----------
+const trains = new Map(); // trainID -> state
+let lastFetchOk = 0, stationsFetched = false;
+
+const LATE_MIN = 15, VERY_LATE_MIN = 60;
+const tier = (late) => late >= VERY_LATE_MIN ? 'vlate' : late >= LATE_MIN ? 'late' : 'ok';
+function parseTime(s) { const t = Date.parse(s); return isFinite(t) ? t : NaN; }
+function lateness(t) {
+  const next = t.stations.find(s => s.status === 'Enroute') || t.stations.filter(s => s.status === 'Departed').pop();
+  if (!next) return 0;
+  const a = parseTime(next.arr || next.dep), b = parseTime(next.schArr || next.schDep);
+  return isFinite(a) && isFinite(b) ? Math.round((a - b) / 60000) : 0;
+}
+
+async function fetchMissingStations(codes) {
+  if (stationsFetched || !codes.length) return;
+  stationsFetched = true;
+  try {
+    const res = await fetch(API + '/stations'); if (!res.ok) return;
+    const all = await res.json();
+    for (const [code, m] of Object.entries(all)) {
+      if (stations[code] || !isFinite(m.lat) || !isFinite(m.lon)) continue;
+      const [x, y] = project(m.lon, m.lat); stations[code] = { node: -1, x, y };
+    }
+    routeCache.clear();
+  } catch (_) { /* positions still work for stations we already know */ }
+}
+
+function ingest(data, fetchedAt) {
+  const seen = new Set(), missing = new Set();
+  for (const list of Object.values(data)) for (const t of list) {
+    if (t.trainState !== 'Active' || !isFinite(t.lat) || !isFinite(t.lon)) continue;
+    if (/via/i.test(t.provider || '') || /via/i.test(t.providerShort || '')) continue;
+    const [x, y] = project(t.lon, t.lat);
+    if (!inUS(x, y)) continue;
+    const stops = (t.stations || []).filter(s => !s.bus);
+    stops.forEach(s => { if (!stations[s.code]) missing.add(s.code); });
+    const knownStops = stops.filter(s => stations[s.code]), known = knownStops.map(s => s.code);
+    if (known.length < 2) continue;
+    const route = buildRoute(known);
+    if (route.total < 1) continue;
+    let ts = parseTime(t.lastValTS);
+    if (!isFinite(ts) || ts > fetchedAt + 60000 || ts < fetchedAt - 30 * 60000) ts = fetchedAt;
+    const id = t.trainID || (t.routeName + t.trainNum);
+    let st = trains.get(id);
+    const hint = st && st.route === route ? st.sDisp : null;
+    const loc = locate(route, x, y, hint);
+    if (loc.d > 60) continue; // position nowhere near its scheduled route
+    const v = Math.max(0, (+t.velocity || 0) * MPH);
+    if (!st || st.route !== route) {
+      const now = Date.now(), s0 = Math.min(route.total, loc.s + v * Math.min(180, (now - ts) / 1000));
+      st = { id, route, sDisp: s0, vDisp: v, born: performance.now(), alpha: 0, pinged: new Set() };
+      route.stopS.forEach((ss, k) => { if (ss <= s0 + 0.1) st.pinged.add(k); }); // no pings for stops already behind it
+      trains.set(id, st);
+    }
+    // The model won't carry a train past the next stop it hasn't reached yet; it eases in and waits
+    const nextIdx = knownStops.findIndex(s => s.status === 'Enroute');
+    st.capS = nextIdx >= 0 ? route.stopS[nextIdx] : route.total;
+    st.nextIdx = nextIdx;
+    Object.assign(st, { sMeas: loc.s, tMeas: ts, vMeas: v, info: t, late: lateness(t), consist: consistFor(t.routeName || ''), gone: false });
+    seen.add(id);
+  }
+  for (const st of trains.values()) if (!seen.has(st.id)) st.gone = true;
+  if (missing.size) fetchMissingStations([...missing]);
+}
+
+const $ = (id) => document.getElementById(id);
+async function poll() {
+  try {
+    const res = await fetch(API + '/trains', { cache: 'no-store' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json(), at = Date.now();
+    ingest(data, at);
+    lastFetchOk = at;
+    $('dot').classList.remove('err'); $('msg').hidden = true;
+  } catch (err) {
+    $('dot').classList.add('err');
+    $('msg').hidden = false;
+    $('msg').textContent = lastFetchOk
+      ? 'Lost the train feed. Trains keep moving on their last known speed; retrying every 30 seconds.'
+      : 'Can’t reach the Amtraker feed (api.amtraker.com). Check your connection or any blocker, and open this file in a regular browser tab. Retrying every 30 seconds.';
+  }
+  updateCount();
+  setTimeout(poll, POLL_MS);
+}
+function updateCount() {
+  const n = [...trains.values()].filter(t => !t.gone).length;
+  if (!lastFetchOk) { $('count').textContent = 'Waiting for train feed'; return; }
+  const ago = Math.round((Date.now() - lastFetchOk) / 1000);
+  $('count').textContent = `${n} trains · updated ${ago < 5 ? 'just now' : ago + ' s ago'}`;
+}
+setInterval(updateCount, 5000);
+
+// ---------- motion model ----------
+// Each train glides along its route at its reported speed. Corrections from new reports are
+// folded in as a gentle speed change rather than a jump, so motion stays continuous.
+function stepTrains(dt) {
+  const now = Date.now();
+  for (const [id, t] of trains) {
+    t.alpha = t.gone ? Math.max(0, t.alpha - dt / 2) : Math.min(1, t.alpha + dt / 1.5);
+    if (t.gone && t.alpha <= 0) { trains.delete(id); continue; }
+    const age = Math.min(240, Math.max(0, (now - t.tMeas) / 1000));
+    const free = Math.min(t.route.total, t.sMeas + t.vMeas * age), hold = Math.max(t.capS, t.sMeas);
+    const capped = free > hold, target = capped ? hold : free;
+    const err = target - t.sDisp;
+    if (err > 40 || err < -8) { t.sDisp = target; t.vDisp = t.vMeas; markPassed(t); continue; }
+    let want = (capped ? 0 : t.vMeas) + err / 25;
+    if (capped) want = Math.min(want, Math.max(t.vMeas, 0.01) * 1.2);
+    // Brake into the next stop (about 0.6 m/s², like a real station stop) instead of overrunning it
+    const brake = Math.sqrt(2 * 0.0006 * Math.max(0, hold - t.sDisp));
+    const braking = want > brake; if (braking) want = brake;
+    want = Math.max(0, want);                      // never run backwards: ahead of the report, it waits
+    t.vDisp += (want - t.vDisp) * Math.min(1, dt * (braking ? 4 : 0.8));
+    t.sDisp = Math.max(0, Math.min(t.route.total, t.sDisp + t.vDisp * dt));
+    // Arrival ping when the drawn train reaches a stop
+    const stopS = t.route.stopS;
+    for (let k = 1; k < stopS.length; k++) {
+      if (t.pinged.has(k) || t.sDisp < stopS[k] - 0.08) continue;
+      t.pinged.add(k);
+      if (!t.gone) { pointAt(t.route, stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: rgbFor(t) }); }
+    }
+  }
+}
+function markPassed(t) { t.route.stopS.forEach((ss, k) => { if (ss <= t.sDisp + 0.08) t.pinged.add(k); }); }
+const pings = [];
+
+// ---------- view ----------
+const canvas = $('map'), ctx = canvas.getContext('2d');
+const base = document.createElement('canvas'), bctx = base.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+// The base map is drawn larger than the screen by MARGIN px on each side, so panning and
+// following only re-render it when the view drifts past that margin or the zoom changes
+const MARGIN = 360, baseView = { x: 0, y: 0, s: 0 };
+const view = { x: 0, y: 0, s: 1 };          // world point at screen center, px per km
+const goal = { s: 1, ax: 0, ay: 0, sx: 0, sy: 0, active: false };
+let minS = 0.1, maxS = 1600, baseDirty = true, follow = null;
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function fit() {
+  const x0 = -2400, x1 = 2300, y0 = -1550, y1 = 1450; // CONUS in projected km
+  const s = Math.min(W / (x1 - x0), H / (y1 - y0)) * 0.94;
+  view.x = (x0 + x1) / 2; view.y = (y0 + y1) / 2 + (W < 600 ? 120 : 0); view.s = goal.s = s; minS = s * 0.7;
+}
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  const first = !W;
+  W = innerWidth; H = innerHeight;
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  base.width = Math.round((W + 2 * MARGIN) * DPR); base.height = Math.round((H + 2 * MARGIN) * DPR);
+  if (first) fit();
+  baseDirty = true;
+}
+const toScreen = (x, y) => [(x - view.x) * view.s + W / 2, (y - view.y) * view.s + H / 2];
+const toWorld = (sx, sy) => [(sx - W / 2) / view.s + view.x, (sy - H / 2) / view.s + view.y];
+
+function zoomAt(factor, sx, sy) {
+  const ns = Math.max(minS, Math.min(maxS, (goal.active ? goal.s : view.s) * factor));
+  const [wx, wy] = toWorld(sx, sy);
+  Object.assign(goal, { s: ns, ax: wx, ay: wy, sx, sy, active: true });
+  if (follow) { goal.ax = view.x; goal.ay = view.y; goal.sx = W / 2; goal.sy = H / 2; }
+  if (reduceMotion) applyZoom(1);
+}
+function applyZoom(k) {
+  if (!goal.active) return;
+  const ls = Math.log(view.s), lg = Math.log(goal.s), nl = ls + (lg - ls) * k;
+  view.s = Math.exp(nl);
+  if (Math.abs(lg - nl) < 0.002) { view.s = goal.s; goal.active = false; }
+  view.x = goal.ax - (goal.sx - W / 2) / view.s; view.y = goal.ay - (goal.sy - H / 2) / view.s;
+  baseDirty = true;
+}
+
+// ---------- input ----------
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const d = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+  zoomAt(Math.exp(-Math.max(-120, Math.min(120, d)) * 0.0024), e.clientX, e.clientY);
+}, { passive: false });
+
+const pointers = new Map(); let drag = null, pinch = null, moved = false;
+canvas.addEventListener('pointerdown', (e) => {
+  canvas.setPointerCapture(e.pointerId); pointers.set(e.pointerId, [e.clientX, e.clientY]); moved = false;
+  if (pointers.size === 1) drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
+  if (pointers.size === 2) { const [a, b] = [...pointers.values()]; pinch = { d: Math.hypot(a[0] - b[0], a[1] - b[1]), s: view.s }; drag = null; }
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (pointers.has(e.pointerId)) pointers.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pinch && pointers.size === 2) {
+    const [a, b] = [...pointers.values()], d = Math.hypot(a[0] - b[0], a[1] - b[1]);
+    const cx = (a[0] + b[0]) / 2, cy = (a[1] + b[1]) / 2, [wx, wy] = toWorld(cx, cy);
+    view.s = Math.max(minS, Math.min(maxS, pinch.s * d / pinch.d));
+    view.x = wx - (cx - W / 2) / view.s; view.y = wy - (cy - H / 2) / view.s;
+    goal.active = false; baseDirty = true; moved = true; return;
+  }
+  if (drag) {
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+    if (Math.abs(dx) + Math.abs(dy) > (e.pointerType === 'mouse' ? 6 : 10)) { moved = true; canvas.classList.add('dragging'); if (follow) setFollow(null); }
+    if (moved) { view.x = drag.vx - dx / view.s; view.y = drag.vy - dy / view.s; goal.active = false; }
+    return;
+  }
+  mouseIn = true; hover(e.clientX, e.clientY);
+});
+const endPointer = (e) => {
+  pointers.delete(e.pointerId); canvas.classList.remove('dragging');
+  if (pointers.size < 2) pinch = null;
+  if (pointers.size === 1) { const [p] = pointers.values(); drag = { x: p[0], y: p[1], vx: view.x, vy: view.y }; }
+  if (!pointers.size) drag = null;
+};
+canvas.addEventListener('pointerup', (e) => {
+  if (!moved) {
+    const t = pick(e.clientX, e.clientY);
+    if (t) { setFollow(t); if (view.s < 6) zoomAt(Math.min(40, 18 / view.s), e.clientX, e.clientY); }
+  }
+  endPointer(e);
+});
+canvas.addEventListener('pointercancel', endPointer);
+canvas.addEventListener('pointerleave', () => { mouseIn = false; hovered = null; hoveredStation = null; $('tip').hidden = true; $('stip').hidden = true; canvas.classList.remove('over-train'); });
+canvas.addEventListener('dblclick', (e) => zoomAt(2.4, e.clientX, e.clientY));
+$('zin').onclick = () => zoomAt(2, W / 2, H / 2);
+$('zout').onclick = () => zoomAt(0.5, W / 2, H / 2);
+$('unfollow').onclick = () => setFollow(null);
+addEventListener('keydown', (e) => {
+  if (e.key === '+' || e.key === '=') zoomAt(1.6, W / 2, H / 2);
+  else if (e.key === '-' || e.key === '_') zoomAt(1 / 1.6, W / 2, H / 2);
+  else if (e.key === 'Escape') setFollow(null);
+});
+addEventListener('resize', resize);
+
+let hovered = null, hoveredStation = null, mouse = [0, 0], mouseIn = false, tipAt = 0;
+// Screen-space hit shapes from the last frame: each train is a polyline through its cars,
+// matched within a generous radius so long trains are hoverable anywhere along their length
+const hits = new Map();
+function distToPolyline(pts, x, y) {
+  let d = Infinity;
+  if (pts.length === 2) return Math.hypot(pts[0] - x, pts[1] - y);
+  for (let i = 0; i < pts.length - 2; i += 2) {
+    const ax = pts[i], ay = pts[i + 1], dx = pts[i + 2] - ax, dy = pts[i + 3] - ay, L2 = dx * dx + dy * dy;
+    const t = L2 ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / L2)) : 0;
+    d = Math.min(d, Math.hypot(ax + dx * t - x, ay + dy * t - y));
+  }
+  return d;
+}
+function pick(sx, sy) {
+  let best = null, bd = Infinity;
+  for (const [id, h] of hits) {
+    const d = distToPolyline(h.pts, sx, sy) - h.w / 2;
+    if (d < h.reach && d < bd) { bd = d; best = trains.get(id); }
+  }
+  return best;
+}
+function pickStation(sx, sy) {
+  let best = null, bd = 11;
+  for (const st of stationDots) { const p = toScreen(st.x, st.y), d = Math.hypot(p[0] - sx, p[1] - sy); if (d < bd) { bd = d; best = st; } }
+  return best;
+}
+function hover(sx, sy) {
+  mouse = [sx, sy];
+  const t = mouseIn && !drag && !pinch ? pick(sx, sy) : null;
+  const st = t || !mouseIn || drag ? null : pickStation(sx, sy);
+  if (t !== hovered) { hovered = t; tipAt = 0; }
+  hoveredStation = st;
+  canvas.classList.toggle('over-train', !!t);
+  const now = performance.now();
+  if (now - tipAt > 400) { renderTip(); tipAt = now; } else placeTip();
+  renderStationTip();
+}
+function setFollow(t) {
+  follow = t ? t.id : null;
+  $('info').hidden = !t;
+  infoAt = 0;
+}
+
+function fmtTime(iso, tz) {
+  const t = parseTime(iso); if (!isFinite(t)) return '–';
+  try { return new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit', timeZone: tz || undefined, timeZoneName: 'short' }).format(t); }
+  catch (_) { return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+}
+function trainFacts(t) {
+  const i = t.info, next = i.stations.find(s => s.status === 'Enroute'), at = i.stations.find(s => s.status === 'Station');
+  const late = t.late, lateTxt = late >= 60 ? `${Math.floor(late / 60)} hr ${late % 60} min late` : late >= 1 ? `${late} min late` : late <= -1 ? `${-late} min early` : 'On time';
+  const el = (tag, cls, text) => { const d = document.createElement(tag); if (cls) d.className = cls; if (text != null) d.textContent = text; return d; };
+  const row = (k, v, cls) => { const d = el('div', 'row', k), b = el('b', cls, v); d.append(b); return d; };
+  const title = el('div', 'ttl', (i.routeName || 'Train') + ' '); title.append(el('span', 'n', String(i.trainNum)));
+  const rows = [
+    row('Speed', `${Math.round(i.velocity || 0)} mph`),
+    at ? row('Now at', at.name) : row('Next stop', next ? next.name : 'Arriving'),
+    ...(!at && next ? [row('Due', fmtTime(next.arr || next.dep, next.tz))] : []),
+    row('Status', lateTxt, 'd'),
+    row('Cars (est.)', String(t.consist.n)),
+  ];
+  return { title, rows, row };
+}
+function placeTip() {
+  const tip = $('tip'); if (tip.hidden) return;
+  const r = tip.getBoundingClientRect();
+  let x = mouse[0], y = mouse[1];
+  if (x + r.width + 30 > W) x -= r.width + 28; if (y + r.height + 30 > H) y -= r.height + 28;
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+}
+function renderTip() {
+  const tip = $('tip'), t = hovered;
+  if (!t || t.id === follow) { tip.hidden = true; return; }
+  const f = trainFacts(t);
+  tip.className = 'card ' + tier(t.late);
+  tip.replaceChildren(f.title, f.row('To', t.info.destName || t.info.destCode || '–'), ...f.rows);
+  tip.hidden = false;
+  placeTip();
+}
+let shownStation = null;
+function renderStationTip() {
+  const tip = $('stip'), st = hoveredStation;
+  if (!st) { tip.hidden = true; shownStation = null; return; }
+  if (st === shownStation && !follow && !goal.active) return;
+  shownStation = st;
+  const p = toScreen(st.x, st.y), code = document.createElement('span'); code.textContent = st.code;
+  tip.replaceChildren(st.name, code);
+  tip.style.left = p[0] + 'px'; tip.style.top = p[1] + 'px'; tip.hidden = false;
+}
+let infoAt = 0;
+function renderInfo(now) {
+  if (!follow || now - infoAt < 1000) return;
+  infoAt = now;
+  const t = trains.get(follow); if (!t) return;
+  const f = trainFacts(t), i = t.info;
+  $('infoTitle').replaceChildren(...f.title.childNodes);
+  $('infoRoute').textContent = `${i.origName || i.origCode || '–'} → ${i.destName || i.destCode || '–'}`;
+  const pct = t.route.total ? Math.round(100 * t.sDisp / t.route.total) : 0;
+  $('infoPct').textContent = `${pct}% of trip`;
+  $('infoBar').style.width = pct + '%';
+  $('infoBar').style.background = `rgb(${rgbFor(t)})`;
+  $('infoRows').className = 'rows ' + tier(t.late);
+  $('infoRows').replaceChildren(...f.rows);
+}
+
+// ---------- terrain and street detail (loaded as tiles while you zoom) ----------
+// Elevation: AWS Terrain Tiles (Terrarium PNG). Streets, water, buildings: OpenFreeMap vector tiles
+// (OpenMapTiles schema). Tiles are decoded, contoured and reprojected to the map's Albers km grid
+// in a worker so following a train never stutters.
+const DEM_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
+const VEC_TILEJSON = 'https://tiles.openfreemap.org/planet';
+
+function tileWorker() {
+  const R = 6371, rad = Math.PI / 180;
+  const P1 = 29.5 * rad, P2 = 45.5 * rad, L0 = -96 * rad, F0 = 37.5 * rad;
+  const N = (Math.sin(P1) + Math.sin(P2)) / 2, C = Math.cos(P1) ** 2 + 2 * N * Math.sin(P1);
+  const RHO0 = Math.sqrt(C - 2 * N * Math.sin(F0)) / N;
+  const out = [0, 0];
+  // tile fraction (fx, fy in 0..1) -> Albers km, written into out
+  function tp(z, x, y, fx, fy) {
+    const n = 2 ** z, lon = ((x + fx) / n) * 2 * Math.PI - Math.PI;
+    const lat = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + fy) / n)));
+    const t = N * (lon - L0), r = Math.sqrt(C - 2 * N * Math.sin(lat)) / N;
+    out[0] = R * r * Math.sin(t); out[1] = -R * (RHO0 - r * Math.cos(t));
+    return out;
+  }
+
+  // ---- minimal protobuf / Mapbox Vector Tile reader ----
+  function decodeMVT(buf) {
+    let pos = 0;
+    const varint = () => { let v = 0, s = 1, b; do { b = buf[pos++]; v += (b & 0x7f) * s; s *= 128; } while (b & 0x80); return v; };
+    const skip = (w) => { if (w === 0) varint(); else if (w === 1) pos += 8; else if (w === 2) pos += varint(); else if (w === 5) pos += 4; };
+    const str = (end) => new TextDecoder().decode(buf.subarray(pos, end));
+    const packed = () => { const len = varint(), end = pos + len, a = []; while (pos < end) a.push(varint()); return a; };
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const layers = [];
+    while (pos < buf.length) {
+      const k = varint();
+      if (k >> 3 !== 3 || (k & 7) !== 2) { skip(k & 7); continue; }
+      const lend = varint() + pos, L = { name: '', extent: 4096, keys: [], values: [], features: [] };
+      while (pos < lend) {
+        const kk = varint(), f = kk >> 3, w = kk & 7;
+        if (f === 1 && w === 2) { const e = varint() + pos; L.name = str(e); pos = e; }
+        else if (f === 2 && w === 2) {
+          const fend = varint() + pos, F = { type: 0, tags: [], geom: [] };
+          while (pos < fend) { const fk = varint(), ff = fk >> 3, fw = fk & 7;
+            if (ff === 2 && fw === 2) F.tags = packed(); else if (ff === 3 && fw === 0) F.type = varint(); else if (ff === 4 && fw === 2) F.geom = packed(); else skip(fw); }
+          L.features.push(F);
+        } else if (f === 3 && w === 2) { const e = varint() + pos; L.keys.push(str(e)); pos = e; }
+        else if (f === 4 && w === 2) {
+          const vend = varint() + pos; let val = null;
+          while (pos < vend) { const vk = varint(), vf = vk >> 3, vw = vk & 7;
+            if (vf === 1 && vw === 2) { const e = varint() + pos; val = str(e); pos = e; }
+            else if (vf === 2 && vw === 5) { val = dv.getFloat32(pos, true); pos += 4; }
+            else if (vf === 3 && vw === 1) { val = dv.getFloat64(pos, true); pos += 8; }
+            else if (vw === 0) { const v = varint(); val = vf === 6 ? (v % 2 ? -(v + 1) / 2 : v / 2) : vf === 7 ? !!v : v; }
+            else skip(vw); }
+          L.values.push(val);
+        } else if (f === 5 && w === 0) L.extent = varint();
+        else skip(w);
+      }
+      layers.push(L);
+    }
+    return layers;
+  }
+  function geomParts(g) { // -> array of [x0,y0,x1,y1,...] parts in tile units, closed flag per part
+    const parts = []; let x = 0, y = 0, cur = null, i = 0;
+    while (i < g.length) {
+      const c = g[i++], id = c & 7, cnt = c >> 3;
+      if (id === 7) { if (cur) cur.closed = true; continue; }
+      for (let k = 0; k < cnt; k++) {
+        const dx = g[i++], dy = g[i++];
+        x += (dx >>> 1) ^ -(dx & 1); y += (dy >>> 1) ^ -(dy & 1);
+        if (id === 1) { cur = { pts: [x, y], closed: false }; parts.push(cur); } else if (cur) cur.pts.push(x, y);
+      }
+    }
+    return parts;
+  }
+  const ROAD = { motorway: 'road1', trunk: 'road1', primary: 'road2', secondary: 'road2', tertiary: 'road3', minor: 'road3', service: 'road4', track: 'road4', path: 'road4', rail: 'rail', transit: 'rail' };
+  function groupOf(layer, type, props) {
+    const cl = props.class;
+    if (layer === 'water' && type === 3) return 'water';
+    if (layer === 'waterway' && type === 2) return cl === 'river' ? 'river' : 'stream';
+    if (layer === 'transportation' && type === 2) return ROAD[cl] || null;
+    if (layer === 'building' && type === 3) return 'building';
+    if ((layer === 'landcover' && (cl === 'wood' || cl === 'grass')) || (layer === 'park' && type === 3)) return type === 3 ? 'green' : null;
+    return null;
+  }
+  async function bytesOf(url) {
+    const res = await fetch(url); if (!res.ok) throw new Error('HTTP ' + res.status);
+    let b = new Uint8Array(await res.arrayBuffer());
+    if (b[0] === 0x1f && b[1] === 0x8b) b = new Uint8Array(await new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+    return b;
+  }
+  async function vector({ url, z, x, y }) {
+    const layers = decodeMVT(await bytesOf(url)), groups = {};
+    for (const L of layers) for (const F of L.features) {
+      const props = {}; for (let i = 0; i < F.tags.length; i += 2) props[L.keys[F.tags[i]]] = L.values[F.tags[i + 1]];
+      const g = groupOf(L.name, F.type, props); if (!g) continue;
+      const G = groups[g] || (groups[g] = { coords: [], starts: [], closed: F.type === 3 });
+      for (const part of geomParts(F.geom)) {
+        if (part.pts.length < 4) continue;
+        G.starts.push(G.coords.length);
+        for (let i = 0; i < part.pts.length; i += 2) { tp(z, x, y, part.pts[i] / L.extent, part.pts[i + 1] / L.extent); G.coords.push(out[0], out[1]); }
+      }
+    }
+    const res = {}, transfer = [];
+    for (const [k, G] of Object.entries(groups)) {
+      const coords = new Float32Array(G.coords), starts = new Uint32Array(G.starts);
+      res[k] = { coords, starts, closed: G.closed }; transfer.push(coords.buffer, starts.buffer);
+    }
+    return [{ groups: res }, transfer];
+  }
+
+  // ---- elevation: hillshade image + contour lines ----
+  const INTERVAL = { 8: 100, 9: 100, 10: 50, 11: 50, 12: 20, 13: 10, 14: 10 };
+  async function dem({ url, z, x, y }) {
+    const res = await fetch(url); if (!res.ok) throw new Error('HTTP ' + res.status);
+    const bmp = await createImageBitmap(await res.blob());
+    const S = 256, oc = new OffscreenCanvas(S, S), g = oc.getContext('2d', { willReadFrequently: true });
+    g.drawImage(bmp, 0, 0); const px = g.getImageData(0, 0, S, S).data;
+    let e = new Float32Array(S * S);
+    for (let i = 0; i < S * S; i++) e[i] = px[i * 4] * 256 + px[i * 4 + 1] + px[i * 4 + 2] / 256 - 32768;
+    const at = (i, j) => e[Math.min(S - 1, Math.max(0, j)) * S + Math.min(S - 1, Math.max(0, i))];
+    const blur = (passes) => {
+      for (let p = 0; p < passes; p++) {
+        const t = new Float32Array(S * S);
+        for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
+          let s = 0; for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) s += at(i + di, j + dj);
+          t[j * S + i] = s / 9;
+        }
+        e = t;
+      }
+    };
+    if (z >= 11) blur(z >= 13 ? 3 : 2);
+
+    // Hillshade (light from the northwest), as translucent dark/light pixels
+    const latC = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 0.5) / 2 ** z)));
+    const mpp = 40075016.7 * Math.cos(latC) / (S * 2 ** z);
+    const ex = z <= 6 ? 7 : z <= 8 ? 4 : z <= 10 ? 2.5 : 1.6;
+    const zen = 45 * rad, az = 135 * rad, flat = Math.cos(zen);
+    const img = new Uint8ClampedArray(S * S * 4);
+    for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
+      const o = (j * S + i) * 4, h = e[j * S + i];
+      if (h <= 0) continue;
+      const dzdx = (at(i + 1, j) - at(i - 1, j)) / (2 * mpp) * ex, dzdy = (at(i, j + 1) - at(i, j - 1)) / (2 * mpp) * ex;
+      const slope = Math.atan(Math.hypot(dzdx, dzdy)), aspect = Math.atan2(dzdy, -dzdx);
+      const sh = Math.cos(zen) * Math.cos(slope) + Math.sin(zen) * Math.sin(slope) * Math.cos(az - aspect), d = sh - flat;
+      if (d < 0) { img[o] = 8; img[o + 1] = 11; img[o + 2] = 14; img[o + 3] = Math.min(150, -d * 300); }
+      else { img[o] = 205; img[o + 1] = 222; img[o + 2] = 228; img[o + 3] = Math.min(26, d * 70); }
+    }
+    // 5x5 warp grid: tile fractions -> Albers km, so the image can be drawn in small affine pieces
+    const grid = new Float32Array(50);
+    for (let b = 0; b <= 4; b++) for (let a = 0; a <= 4; a++) { tp(z, x, y, a / 4, b / 4); grid[(b * 5 + a) * 2] = out[0]; grid[(b * 5 + a) * 2 + 1] = out[1]; }
+
+    // Contours on a lightly smoothed grid, padded by one sample so lines reach the tile edge
+    const iv = INTERVAL[z] || 0, segs = [], major = [];
+    if (iv) {
+      blur(z >= 12 ? 2 : 1);
+      const G = S + 2, pos = new Float32Array(G);
+      for (let k = 0; k < G; k++) pos[k] = k === 0 ? 0 : k === G - 1 ? 1 : (k - 0.5) / S;
+      const val = (a, b) => at(a - 1, b - 1);
+      const emit = (L, ax, ay, bx, by) => {
+        const arr = Math.round(L / iv) % 5 === 0 ? major : segs;
+        tp(z, x, y, ax, ay); arr.push(out[0], out[1]); tp(z, x, y, bx, by); arr.push(out[0], out[1]);
+      };
+      for (let b = 0; b < G - 1; b++) for (let a = 0; a < G - 1; a++) {
+        const v0 = val(a, b), v1 = val(a + 1, b), v2 = val(a + 1, b + 1), v3 = val(a, b + 1);
+        const lo = Math.min(v0, v1, v2, v3), hi = Math.max(v0, v1, v2, v3);
+        if (hi <= 0) continue;
+        const x0 = pos[a], x1 = pos[a + 1], y0 = pos[b], y1 = pos[b + 1];
+        for (let L = Math.max(iv, Math.ceil(lo / iv) * iv); L <= hi; L += iv) {
+          if (L === lo) continue;
+          const c = (v0 > L ? 1 : 0) | (v1 > L ? 2 : 0) | (v2 > L ? 4 : 0) | (v3 > L ? 8 : 0);
+          if (c === 0 || c === 15) continue;
+          const f = (p, q) => (L - p) / (q - p);
+          const T = [x0 + (x1 - x0) * f(v0, v1), y0], Rr = [x1, y0 + (y1 - y0) * f(v1, v2)];
+          const B = [x0 + (x1 - x0) * f(v3, v2), y1], Lf = [x0, y0 + (y1 - y0) * f(v0, v3)];
+          const pairs = { 1: [Lf, T], 2: [T, Rr], 3: [Lf, Rr], 4: [Rr, B], 5: [Lf, T, Rr, B], 6: [T, B], 7: [Lf, B],
+            8: [B, Lf], 9: [B, T], 10: [T, Rr, B, Lf], 11: [B, Rr], 12: [Rr, Lf], 13: [Rr, T], 14: [T, Lf] }[c];
+          for (let k = 0; k < pairs.length; k += 2) emit(L, pairs[k][0], pairs[k][1], pairs[k + 1][0], pairs[k + 1][1]);
+        }
+      }
+    }
+    const minor = new Float32Array(segs), maj = new Float32Array(major);
+    return [{ img, grid, minor, major: maj }, [img.buffer, grid.buffer, minor.buffer, maj.buffer]];
+  }
+
+  self.onmessage = async (ev) => {
+    const m = ev.data;
+    try {
+      const [res, transfer] = m.kind === 'dem' ? await dem(m) : await vector(m);
+      self.postMessage({ key: m.key, ...res }, transfer);
+    } catch (err) { self.postMessage({ key: m.key, error: String(err && err.message || err) }); }
+  };
+}
+
+const tiles = (() => {
+  let worker = null;
+  try { worker = new Worker(URL.createObjectURL(new Blob(['(' + tileWorker.toString() + ')()'], { type: 'text/javascript' }))); }
+  catch (_) { /* no detail layers without workers */ }
+  const cache = new Map(), queue = [];
+  let inflight = 0, vecTemplate = null, vecMax = 14, stamp = 0;
+
+  if (worker) fetch(VEC_TILEJSON).then(r => r.ok ? r.json() : null).then(j => {
+    if (j && j.tiles && j.tiles[0]) { vecTemplate = j.tiles[0]; vecMax = Math.min(14, j.maxzoom || 14); baseDirty = true; }
+  }).catch(() => {});
+
+  function toPaths(m) {
+    if (m.kind === 'dem') {
+      const cv = document.createElement('canvas'); cv.width = cv.height = 256;
+      cv.getContext('2d').putImageData(new ImageData(m.img, 256, 256), 0, 0);
+      const seg = (a) => { const p = new Path2D(); for (let i = 0; i < a.length; i += 4) { p.moveTo(a[i], a[i + 1]); p.lineTo(a[i + 2], a[i + 3]); } return p; };
+      return { img: cv, grid: m.grid, minor: m.minor.length ? seg(m.minor) : null, major: m.major.length ? seg(m.major) : null };
+    }
+    const g = {};
+    for (const [k, G] of Object.entries(m.groups)) {
+      const p = new Path2D(), c = G.coords, st = G.starts;
+      for (let s = 0; s < st.length; s++) {
+        const a = st[s], b = s + 1 < st.length ? st[s + 1] : c.length;
+        p.moveTo(c[a], c[a + 1]); for (let i = a + 2; i < b; i += 2) p.lineTo(c[i], c[i + 1]);
+        if (G.closed) p.closePath();
+      }
+      g[k] = p;
+    }
+    return { groups: g };
+  }
+  if (worker) worker.onmessage = (ev) => {
+    const m = ev.data, ent = cache.get(m.key); inflight--;
+    if (ent) {
+      if (m.error) ent.state = 'error';
+      else { m.kind = ent.kind; Object.assign(ent, toPaths(m)); ent.state = 'ready'; baseDirty = true; }
+    }
+    pump();
+  };
+  function pump() {
+    while (inflight < 6 && queue.length) {
+      queue.sort((a, b) => a.prio - b.prio);
+      const q = queue.shift(), ent = cache.get(q.key);
+      if (!ent || ent.state !== 'queued') continue;
+      if (stamp - ent.used > 2) { cache.delete(q.key); continue; } // no longer on screen
+      ent.state = 'loading'; inflight++;
+      worker.postMessage({ key: q.key, kind: q.kind, url: q.url, z: q.z, x: q.x, y: q.y });
+    }
+  }
+  function get(kind, z, x, y, prio) {
+    const key = kind + z + '/' + x + '/' + y;
+    let ent = cache.get(key);
+    if (!ent) {
+      const url = (kind === 'dem' ? DEM_URL : vecTemplate).replace('{z}', z).replace('{x}', x).replace('{y}', y);
+      ent = { kind, state: 'queued', used: stamp }; cache.set(key, ent);
+      queue.push({ key, kind, url, z, x, y, prio });
+    }
+    ent.used = stamp;
+    return ent;
+  }
+  function evict() {
+    if (cache.size < 260) return;
+    const old = [...cache.entries()].filter(([, e]) => e.state === 'ready' || e.state === 'error').sort((a, b) => a[1].used - b[1].used);
+    for (let i = 0; i < old.length && cache.size > 200; i++) cache.delete(old[i][0]);
+  }
+  const lonLatTile = (lon, lat, z) => {
+    const n = 2 ** z, la = Math.max(-85, Math.min(85, lat)) * rad;
+    return [Math.floor((lon + 180) / 360 * n), Math.floor((1 - Math.log(Math.tan(la) + 1 / Math.cos(la)) / Math.PI) / 2 * n)];
+  };
+  // Tiles covering the given world rectangle at zoom z, nearest the center first. Falls back to a
+  // loaded ancestor for tiles still on their way, so detail never blinks out while zooming.
+  function cover(kind, z, x0, y0, x1, y1, minZ) {
+    let lo0 = 180, lo1 = -180, la0 = 90, la1 = -90;
+    for (let k = 0; k <= 6; k++) for (const [x, y] of [[x0 + (x1 - x0) * k / 6, y0], [x0 + (x1 - x0) * k / 6, y1], [x0, y0 + (y1 - y0) * k / 6], [x1, y0 + (y1 - y0) * k / 6]]) {
+      const [lon, lat] = unproject(x, y); lo0 = Math.min(lo0, lon); lo1 = Math.max(lo1, lon); la0 = Math.min(la0, lat); la1 = Math.max(la1, lat);
+    }
+    lo0 = Math.max(lo0, -127); lo1 = Math.min(lo1, -65); la0 = Math.max(la0, 23); la1 = Math.min(la1, 50);
+    if (lo0 > lo1 || la0 > la1) return { list: [], ready: 1 };
+    let tx0, ty0, tx1, ty1;
+    for (;;) {
+      [tx0, ty1] = lonLatTile(lo0, la0, z); [tx1, ty0] = lonLatTile(lo1, la1, z);
+      if ((tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= 48 || z <= minZ) break;
+      z--;
+    }
+    const cx = (tx0 + tx1) / 2, cy = (ty0 + ty1) / 2, out = [], seen = new Set(); let ready = 0, total = 0;
+    for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
+      total++;
+      const e = get(kind, z, tx, ty, Math.hypot(tx - cx, ty - cy));
+      if (e.state === 'ready') { ready++; out.push(e); continue; }
+      for (let pz = z - 1, px = tx >> 1, py = ty >> 1; pz >= Math.max(minZ, z - 4); pz--, px >>= 1, py >>= 1) {
+        const pk = kind + pz + '/' + px + '/' + py, pe = cache.get(pk);
+        if (pe && pe.state === 'ready') { if (!seen.has(pk)) { seen.add(pk); pe.used = stamp; out.unshift(pe); } break; }
+      }
+    }
+    return { list: out, ready: total ? ready / total : 1, z };
+  }
+  return {
+    enabled: () => !!worker,
+    hasVector: () => !!vecTemplate,
+    vecMax: () => vecMax,
+    begin() { stamp++; },
+    end() { evict(); pump(); },
+    cover,
+  };
+})();
+
+// ---------- drawing ----------
+const COL = {
+  ground: '#15181b', land: '#1f2327', coast: 'rgba(120,140,150,0.30)', border: 'rgba(150,172,182,0.34)',
+  roadMajor: 'rgba(150,165,175,', roadMinor: 'rgba(140,155,165,', track: 'rgba(110,150,165,',
+  accent: [99, 197, 191], late: [227, 168, 107], vlate: [226, 114, 124], car: '#dfeef0', station: 'rgba(196,214,220,',
+  water: 'rgba(96,140,160,', contour: 'rgba(150,176,186,', building: 'rgba(160,182,192,0.075)', green: 'rgba(120,160,150,0.035)',
+};
+const rgbFor = (t) => ({ ok: COL.accent, late: COL.late, vlate: COL.vlate })[tier(t.late)];
+const ramp = (v, a, b) => Math.max(0, Math.min(1, (v - a) / (b - a)));
+
+function drawBase() {
+  const c = bctx, s = view.s, BW = W + 2 * MARGIN, BH = H + 2 * MARGIN;
+  Object.assign(baseView, { x: view.x, y: view.y, s });
+  const bs = (x, y) => [(x - view.x) * s + BW / 2, (y - view.y) * s + BH / 2];
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.fillStyle = COL.ground; c.fillRect(0, 0, base.width, base.height);
+  const world = () => c.setTransform(s * DPR, 0, 0, s * DPR, (BW / 2 - view.x * s) * DPR, (BH / 2 - view.y * s) * DPR);
+  world();
+  c.lineJoin = 'round'; c.lineCap = 'round';
+  const m = 4 / s, vx0 = view.x - BW / 2 / s, vx1 = view.x + BW / 2 / s, vy0 = view.y - BH / 2 / s, vy1 = view.y + BH / 2 / s;
+  const stroke = (L) => {
+    if (s < 2.5) { c.stroke(L.all); return; }
+    for (const ch of L.chunks) if (ch.x1 >= vx0 - m && ch.x0 <= vx1 + m && ch.y1 >= vy0 - m && ch.y0 <= vy1 + m) c.stroke(ch.p);
+  };
+  const px = 1 / s, clampW = (k, lo, hi) => Math.max(lo, Math.min(hi, k * s)) * px;
+  c.fillStyle = COL.land; c.fill(layers.land, 'evenodd');
+
+  // Everything that describes the ground stays inside the US outline
+  c.save(); c.clip(layers.land, 'evenodd');
+  tiles.begin();
+  const latC = unproject(view.x, view.y)[1], kmPerDeg = Math.cos(latC * rad);
+  let vec = null;
+  if (tiles.enabled()) {
+    // Terrain: hillshade at every zoom, contours once zoomed in
+    const zd = Math.max(3, Math.min(14, Math.floor(Math.log2(40075 * kmPerDeg * s / 256)) - 1));
+    const dem = tiles.cover('dem', zd, vx0, vy0, vx1, vy1, 3);
+    c.imageSmoothingEnabled = true;
+    c.globalAlpha = 1 - 0.6 * ramp(s, 25, 300);
+    for (const t of dem.list) drawWarped(c, t.img, t.grid);
+    c.globalAlpha = 1;
+    for (const t of dem.list) {
+      if (t.minor) { c.strokeStyle = COL.contour + '0.085)'; c.lineWidth = 0.8 * px; c.stroke(t.minor); }
+      if (t.major) { c.strokeStyle = COL.contour + '0.16)'; c.lineWidth = 1.1 * px; c.stroke(t.major); }
+    }
+    // Streets, water, buildings from vector tiles once zoomed past state level
+    const zv = Math.min(tiles.vecMax(), Math.round(Math.log2(40075 * kmPerDeg * s / 512)));
+    if (tiles.hasVector() && zv >= 9) vec = tiles.cover('vec', zv, vx0, vy0, vx1, vy1, 6);
+  }
+  const vecFull = vec && vec.ready > 0.8;
+  const each = (g, fn) => { if (vec) for (const t of vec.list) if (t.groups && t.groups[g]) fn(t.groups[g]); };
+
+  each('green', p => { c.fillStyle = COL.green; c.fill(p); });
+  // Water: the same ground tone as the ocean, with a faint shoreline
+  if (!vecFull) { c.fillStyle = COL.ground; c.fill(layers.lakes); c.strokeStyle = COL.water + '0.28)'; c.lineWidth = px; c.stroke(layers.lakes); }
+  each('water', p => { c.fillStyle = COL.ground; c.fill(p); c.strokeStyle = COL.water + '0.3)'; c.lineWidth = px; c.stroke(p); });
+  if (!vecFull) {
+    const rmaj = ramp(s, 0.3, 0.8), rmin = ramp(s, 1.2, 2.6);
+    if (rmin > 0) { c.strokeStyle = COL.water + (0.22 * rmin) + ')'; c.lineWidth = px; stroke(layers.riversMinor); }
+    if (rmaj > 0) { c.strokeStyle = COL.water + (0.36 * rmaj) + ')'; c.lineWidth = px * (s > 4 ? 1.6 : 1.1); stroke(layers.riversMajor); }
+  }
+  each('stream', p => { c.strokeStyle = COL.water + '0.3)'; c.lineWidth = clampW(0.003, 0.7, 1.6); c.stroke(p); });
+  each('river', p => { c.strokeStyle = COL.water + '0.45)'; c.lineWidth = clampW(0.012, 1.1, 5); c.stroke(p); });
+
+  if (!vecFull) {
+    const minor = ramp(s, 2.2, 4.5), major = ramp(s, 0.7, 1.6);
+    if (minor > 0) { c.strokeStyle = COL.roadMinor + (0.16 * minor) + ')'; c.lineWidth = px; stroke(layers.roadsMinor); }
+    if (major > 0) { c.strokeStyle = COL.roadMajor + (0.22 * major) + ')'; c.lineWidth = px * (s > 4 ? 1.5 : 1); stroke(layers.roadsMajor); }
+  }
+  each('road4', p => { c.strokeStyle = COL.roadMinor + '0.11)'; c.lineWidth = clampW(0.004, 0.6, 2.2); c.stroke(p); });
+  each('road3', p => { c.strokeStyle = COL.roadMinor + '0.17)'; c.lineWidth = clampW(0.007, 0.8, 3.4); c.stroke(p); });
+  each('road2', p => { c.strokeStyle = COL.roadMajor + '0.23)'; c.lineWidth = clampW(0.01, 1, 4.6); c.stroke(p); });
+  each('road1', p => { c.strokeStyle = COL.roadMajor + '0.3)'; c.lineWidth = clampW(0.013, 1.3, 6); c.stroke(p); });
+  each('building', p => { c.fillStyle = COL.building; c.fill(p); });
+  each('rail', p => { c.strokeStyle = COL.track + '0.3)'; c.lineWidth = clampW(0.0025, 0.8, 2); c.stroke(p); });
+  tiles.end();
+  c.restore();
+
+  c.strokeStyle = COL.coast; c.lineWidth = px; stroke(layers.coast);
+  c.setLineDash([1.2 * px, 4 * px]); c.strokeStyle = COL.border; c.lineWidth = 1.2 * px;
+  if (s < 2.5) stroke(layers.borders);
+  else {
+    // Dashing is costly per dash, so clip each border segment to the view first. Clipped starts
+    // snap back to a whole dash period so the pattern doesn't crawl while panning.
+    const per = 5.2 * px, bp = new Path2D();
+    for (const ch of layers.borders.chunks) {
+      if (ch.x1 < vx0 - m || ch.x0 > vx1 + m || ch.y1 < vy0 - m || ch.y0 > vy1 + m) continue;
+      const a = ch.a;
+      for (let i = 0; i < a.length - 2; i += 2) {
+        const ax = a[i], ay = a[i + 1], bx = a[i + 2], by = a[i + 3];
+        const cl = clipSeg(ax, ay, bx, by, vx0 - m, vy0 - m, vx1 + m, vy1 + m); if (!cl) continue;
+        const len = Math.hypot(bx - ax, by - ay); if (!len) continue;
+        const t0 = Math.floor(cl[0] * len / per) * per / len;
+        bp.moveTo(ax + (bx - ax) * t0, ay + (by - ay) * t0); bp.lineTo(ax + (bx - ax) * cl[1], ay + (by - ay) * cl[1]);
+      }
+    }
+    c.stroke(bp);
+  }
+  c.setLineDash([]);
+
+  c.strokeStyle = COL.track + (0.38 + 0.2 * ramp(s, 1, 10)) + ')'; c.lineWidth = px * (s > 30 ? 2.2 : s > 3 ? 1.5 : 1.1); stroke(layers.track);
+
+  // Station dots, in screen space so they stay a constant size
+  c.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const dr = s < 0.6 ? 1.3 : s < 6 ? 1.8 : 2.6, dots = new Path2D();
+  for (const st of stationDots) {
+    const p = bs(st.x, st.y); if (p[0] < -5 || p[1] < -5 || p[0] > BW + 5 || p[1] > BH + 5) continue;
+    dots.moveTo(p[0] + dr, p[1]); dots.arc(p[0], p[1], dr, 0, Math.PI * 2);
+  }
+  c.fillStyle = COL.station + (s < 0.6 ? 0.3 : 0.42) + ')'; c.fill(dots);
+  baseDirty = false;
+
+  // Draws a Mercator image tile into Albers space as 16 small affine pieces (seams overlap 1px)
+  function drawWarped(c, img, g) {
+    const M = c.getTransform();
+    for (let b = 0; b < 4; b++) for (let a = 0; a < 4; a++) {
+      const i00 = (b * 5 + a) * 2, i10 = i00 + 2, i01 = i00 + 10;
+      const sx = a * 64, sy = b * 64;
+      const ax = (g[i10] - g[i00]) / 64, ay = (g[i10 + 1] - g[i00 + 1]) / 64, cx = (g[i01] - g[i00]) / 64, cy = (g[i01 + 1] - g[i00 + 1]) / 64;
+      const ex = g[i00] - ax * sx - cx * sy, ey = g[i00 + 1] - ay * sx - cy * sy;
+      c.setTransform(M.a * ax + M.c * ay, M.b * ax + M.d * ay, M.a * cx + M.c * cy, M.b * cx + M.d * cy, M.a * ex + M.c * ey + M.e, M.b * ex + M.d * ey + M.f);
+      c.drawImage(img, sx, sy, 65, 65, sx, sy, 65, 65);
+    }
+    c.setTransform(M);
+  }
+}
+
+const tmpA = [0, 0], tmpB = [0, 0];
+const sprites = new Map();
+function glowSprite(rgb) {
+  // Built pixel by pixel with a little noise so the very faint falloff doesn't band into rings
+  const k = rgb.join(); if (sprites.has(k)) return sprites.get(k);
+  const S = 384, cv = document.createElement('canvas'); cv.width = cv.height = S;
+  const g = cv.getContext('2d'), img = g.createImageData(S, S), d = img.data;
+  for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+    const f = Math.min(1, Math.hypot(x - S / 2 + 0.5, y - S / 2 + 0.5) / (S / 2));
+    const al = 0.17 * Math.exp(-f * f * 3.5) * (1 - f) ** 2 * 255 + Math.random() - 0.5;
+    const o = (y * S + x) * 4; d[o] = rgb[0]; d[o + 1] = rgb[1]; d[o + 2] = rgb[2]; d[o + 3] = Math.max(0, Math.round(al));
+  }
+  g.putImageData(img, 0, 0);
+  sprites.set(k, cv); return cv;
+}
+function roundRect(c, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+}
+
+function trainGeom(t) {
+  const s = view.s, far = 1 - ramp(s, 0.4, 3), near = ramp(s, 0.6, 25);
+  // Car geometry: true scale when zoomed in, a legible minimum when zoomed out
+  const carPx = Math.max(0.0255 * s, 3 + 7 * near), gapPx = Math.max(0.0015 * s, 0.8 + 1.2 * near);
+  const wPx = Math.max(0.0031 * s, 2.6 + 2.6 * near), carKm = carPx / s, gapKm = gapPx / s;
+  return { s, far, near, wPx, carKm, gapKm, trainKm: t.consist.n * (carKm + gapKm) };
+}
+
+// Soft effects: the trail behind the train and its glow. Drawn clipped to the US outline.
+function drawTrainFx(c, t) {
+  const r = t.route, a = t.alpha, rgb = rgbFor(t), G = trainGeom(t), { s, far, near, wPx, trainKm } = G, head = t.sDisp;
+  const trailPx = 70 + 110 * far, trailKm = Math.min(trailPx / s, 400);
+  const tail0 = head - trainKm, steps = 22, trailA = (0.25 + 0.55 * far) * a;
+  if (tail0 > 0 && trailA > 0.02) {
+    c.lineCap = 'round';
+    for (let k = 0; k < steps; k++) {
+      const f0 = k / steps, f1 = (k + 1) / steps;
+      const s0 = tail0 - trailKm * (1 - f0), s1 = tail0 - trailKm * (1 - f1);
+      if (s1 <= 0) continue;
+      pointAt(r, Math.max(0, s0), tmpA); pointAt(r, s1, tmpB);
+      const p0 = toScreen(tmpA[0], tmpA[1]), p1 = toScreen(tmpB[0], tmpB[1]);
+      const e = f1 * f1;
+      c.strokeStyle = `rgba(${rgb},${(trailA * e * 0.1).toFixed(3)})`; c.lineWidth = wPx * 3.2 * (0.4 + 0.6 * f1);
+      c.beginPath(); c.moveTo(p0[0], p0[1]); c.lineTo(p1[0], p1[1]); c.stroke();
+      c.strokeStyle = `rgba(${rgb},${(trailA * e).toFixed(3)})`; c.lineWidth = Math.max(1, wPx * 0.55 * (0.3 + 0.7 * f1));
+      c.beginPath(); c.moveTo(p0[0], p0[1]); c.lineTo(p1[0], p1[1]); c.stroke();
+    }
+  }
+  // Wide, faint glow: a pre-rendered falloff sprite, centered mid-train
+  pointAt(r, Math.max(0, head - trainKm / 2), tmpB);
+  const gp = toScreen(tmpB[0], tmpB[1]), gr = Math.min(Math.max(70 + 40 * near, trainKm * s * 0.6), 260);
+  c.globalAlpha = (0.55 + 0.45 * far) * a * 0.42;
+  c.drawImage(glowSprite(rgb), gp[0] - gr, gp[1] - gr, gr * 2, gr * 2);
+  c.globalAlpha = 1;
+}
+
+function drawTrain(c, t) {
+  const r = t.route, a = t.alpha, rgb = rgbFor(t), sel = follow === t.id || hovered === t;
+  const { s, wPx, carKm, gapKm } = trainGeom(t), head = t.sDisp, n = t.consist.n;
+
+  // Route ahead for the selected train
+  if (sel) {
+    c.save(); c.strokeStyle = `rgba(${rgb},0.35)`; c.lineWidth = 1.2; c.setLineDash([2, 5]);
+    c.beginPath();
+    pointAt(r, head, tmpA); let q = toScreen(tmpA[0], tmpA[1]);
+    const reach = head + Math.hypot(W, H) / s * 1.2;
+    for (let i = seg(r, head) + 1; i < r.xs.length; i++) {
+      const p = toScreen(r.xs[i], r.ys[i]), cl = clipSeg(q[0], q[1], p[0], p[1], -20, -20, W + 20, H + 20);
+      if (cl) { const dx = p[0] - q[0], dy = p[1] - q[1]; c.moveTo(q[0] + dx * cl[0], q[1] + dy * cl[0]); c.lineTo(q[0] + dx * cl[1], q[1] + dy * cl[1]); }
+      q = p; if (r.cum[i] > reach) break;
+    }
+    c.stroke(); c.restore();
+  }
+
+  pointAt(r, head, tmpA);
+  const hp = toScreen(tmpA[0], tmpA[1]), hitPts = [hp[0], hp[1]];
+  // Cars as rounded rectangles laid along the track, each on its own chord so the train bends
+  const kind = t.consist.kind;
+  for (let i = 0; i < n; i++) {
+    const sa = head - i * (carKm + gapKm), sb = sa - carKm;
+    if (sa <= 0) break;
+    pointAt(r, sa, tmpA); pointAt(r, Math.max(0, sb), tmpB);
+    const pa = toScreen(tmpA[0], tmpA[1]), pb = toScreen(tmpB[0], tmpB[1]);
+    hitPts.push(pb[0], pb[1]);
+    const len = Math.hypot(pa[0] - pb[0], pa[1] - pb[1]); if (len < 0.5) continue;
+    const ang = Math.atan2(pa[1] - pb[1], pa[0] - pb[0]);
+    const loco = i === 0 || ((kind === 'both') && i === n - 1) || (kind === 'double' && i === 1);
+    c.save();
+    c.translate((pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2); c.rotate(ang);
+    c.globalAlpha = a;
+    c.fillStyle = loco ? `rgb(${rgb})` : COL.car;
+    c.beginPath(); roundRect(c, -len / 2, -wPx / 2, len, wPx, Math.min(wPx * 0.45, i === 0 ? wPx : wPx * 0.35)); c.fill();
+    if (sel) { c.strokeStyle = `rgba(${rgb},0.9)`; c.lineWidth = 1; c.stroke(); }
+    c.restore();
+  }
+  hits.set(t.id, { pts: hitPts, w: wPx, reach: 14 });
+}
+
+// Arrival pings: two thin rings that spread out from the station and fade
+const PING_MS = 2600;
+function drawPings(c, now) {
+  for (let i = pings.length - 1; i >= 0; i--) if (now - pings[i].t0 > PING_MS + 600) pings.splice(i, 1);
+  c.lineWidth = 1.2;
+  for (const pg of pings) {
+    const p = toScreen(pg.x, pg.y);
+    if (p[0] < -200 || p[1] < -200 || p[0] > W + 200 || p[1] > H + 200) continue;
+    for (const delay of [0, 500]) {
+      const k = (now - pg.t0 - delay) / PING_MS; if (k < 0 || k > 1) continue;
+      const e = 1 - (1 - k) ** 3, r = 4 + 130 * e, al = 0.38 * (1 - k) ** 2;
+      c.strokeStyle = `rgba(${pg.rgb},${al.toFixed(3)})`;
+      c.beginPath(); c.arc(p[0], p[1], r, 0, Math.PI * 2); c.stroke();
+    }
+    const k0 = (now - pg.t0) / 900;
+    if (k0 < 1) { c.fillStyle = `rgba(${pg.rgb},${(0.5 * (1 - k0)).toFixed(3)})`; c.beginPath(); c.arc(p[0], p[1], 3.5, 0, Math.PI * 2); c.fill(); }
+  }
+}
+
+let lastT = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
+  stepTrains(dt);
+  if (follow) {
+    const t = trains.get(follow);
+    if (!t) setFollow(null);
+    else { pointAt(t.route, t.sDisp, tmpA); view.x += (tmpA[0] - view.x) * Math.min(1, dt * 4); view.y += (tmpA[1] - view.y) * Math.min(1, dt * 4); if (goal.active) { goal.ax = view.x; goal.ay = view.y; goal.sx = W / 2; goal.sy = H / 2; } }
+  }
+  applyZoom(Math.min(1, dt * 9));
+  let ox = (view.x - baseView.x) * view.s, oy = (view.y - baseView.y) * view.s;
+  if (baseDirty || view.s !== baseView.s || Math.abs(ox) > MARGIN - 2 || Math.abs(oy) > MARGIN - 2) { drawBase(); ox = oy = 0; }
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(base, Math.round((MARGIN + ox) * DPR), Math.round((MARGIN + oy) * DPR), canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
+  hits.clear();
+  const pad = 400 / view.s + 50;
+  const [vx0, vy0] = toWorld(0, 0), [vx1, vy1] = toWorld(W, H);
+  const order = [...trains.values()].sort((a, b) => (a === hovered || a.id === follow) - (b === hovered || b.id === follow)).filter(t => {
+    pointAt(t.route, t.sDisp, tmpA);
+    return !(tmpA[0] < vx0 - pad || tmpA[0] > vx1 + pad || tmpA[1] < vy0 - pad || tmpA[1] > vy1 + pad);
+  });
+  // Glows, trails and pings never spill past the US outline. Clipping costs a full-screen pass, so
+  // it's skipped when no stretch of outline is near the view (the view is then all land or all water).
+  ctx.save();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  const gm = 300 / view.s, outlineNear = layers.coast.chunks.some(ch => ch.x1 >= vx0 - gm && ch.x0 <= vx1 + gm && ch.y1 >= vy0 - gm && ch.y0 <= vy1 + gm);
+  if (outlineNear || !inUS(view.x, view.y)) {
+    ctx.setTransform(view.s * DPR, 0, 0, view.s * DPR, (W / 2 - view.x * view.s) * DPR, (H / 2 - view.y * view.s) * DPR);
+    ctx.clip(layers.land, 'evenodd');
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  for (const t of order) drawTrainFx(ctx, t);
+  drawPings(ctx, now);
+  ctx.restore();
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  for (const t of order) drawTrain(ctx, t);
+  if (hoveredStation) {
+    const p = toScreen(hoveredStation.x, hoveredStation.y);
+    ctx.strokeStyle = 'rgba(228,238,240,0.7)'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(p[0], p[1], 5, 0, Math.PI * 2); ctx.stroke();
+  }
+  // Re-check hover every frame: trains move under a still cursor, and the map moves while following
+  if (mouseIn) hover(mouse[0], mouse[1]);
+  renderInfo(now);
+  requestAnimationFrame(frame);
+}
+
+resize();
+requestAnimationFrame(frame);
+poll();
+})();
+</script>
+</body>
+</html>
