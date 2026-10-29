@@ -103,61 +103,87 @@ function tileWorker() {
 
   // ---- elevation: hillshade image + contour lines ----
   const INTERVAL = { 8: 100, 9: 100, 10: 50, 11: 50, 12: 20, 13: 10, 14: 10 };
-  async function dem({ url, z, x, y }) {
-    const res = await fetch(url); if (!res.ok) throw new Error('HTTP ' + res.status);
-    const bmp = await createImageBitmap(await res.blob());
-    const S = 256, oc = new OffscreenCanvas(S, S), g = oc.getContext('2d', { willReadFrequently: true });
-    g.drawImage(bmp, 0, 0); const px = g.getImageData(0, 0, S, S).data;
-    let e = new Float32Array(S * S);
-    for (let i = 0; i < S * S; i++) e[i] = px[i * 4] * 256 + px[i * 4 + 1] + px[i * 4 + 2] / 256 - 32768;
-    const at = (i, j) => e[Math.min(S - 1, Math.max(0, j)) * S + Math.min(S - 1, Math.max(0, i))];
+  // Decoded elevation per tile, shared between a tile and its neighbours' edge padding
+  const elevCache = new Map();
+  function elevation(tmpl, z, x, y) {
+    const n = 2 ** z; if (y < 0 || y >= n) return Promise.resolve(null);
+    x = ((x % n) + n) % n;
+    const key = z + '/' + x + '/' + y;
+    if (elevCache.has(key)) { const v = elevCache.get(key); elevCache.delete(key); elevCache.set(key, v); return v; }
+    const p = (async () => {
+      const res = await fetch(tmpl.replace('{z}', z).replace('{x}', x).replace('{y}', y)); if (!res.ok) return null;
+      const bmp = await createImageBitmap(await res.blob());
+      const oc = new OffscreenCanvas(256, 256), g = oc.getContext('2d', { willReadFrequently: true });
+      g.drawImage(bmp, 0, 0); const px = g.getImageData(0, 0, 256, 256).data, e = new Float32Array(65536);
+      for (let i = 0; i < 65536; i++) e[i] = px[i * 4] * 256 + px[i * 4 + 1] + px[i * 4 + 2] / 256 - 32768;
+      return e;
+    })().catch(() => null);
+    elevCache.set(key, p);
+    if (elevCache.size > 120) elevCache.delete(elevCache.keys().next().value);
+    return p;
+  }
+  async function dem({ tmpl, z, x, y }) {
+    const S = 256, P = 6, G = S + 2 * P; // tile plus a border of its neighbours' pixels
+    const tiles = await Promise.all([-1, 0, 1].flatMap(dy => [-1, 0, 1].map(dx => elevation(tmpl, z, x + dx, y + dy))));
+    const mid = tiles[4]; if (!mid) throw new Error('no elevation tile');
+    let e = new Float32Array(G * G);
+    for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) {
+      let gi = i - P, gj = j - P, tx = 1, ty = 1;
+      if (gi < 0) { tx = 0; gi += S; } else if (gi >= S) { tx = 2; gi -= S; }
+      if (gj < 0) { ty = 0; gj += S; } else if (gj >= S) { ty = 2; gj -= S; }
+      const t = tiles[ty * 3 + tx];
+      e[j * G + i] = t ? t[gj * S + gi] : mid[Math.min(S - 1, Math.max(0, j - P)) * S + Math.min(S - 1, Math.max(0, i - P))];
+    }
+    const at = (i, j) => e[(Math.min(G - 1, Math.max(0, j + P))) * G + Math.min(G - 1, Math.max(0, i + P))]; // tile pixel coords
     const blur = (passes) => {
       for (let p = 0; p < passes; p++) {
-        const t = new Float32Array(S * S);
-        for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
-          let s = 0; for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) s += at(i + di, j + dj);
-          t[j * S + i] = s / 9;
+        const t = new Float32Array(G * G);
+        for (let j = 0; j < G; j++) for (let i = 0; i < G; i++) {
+          let s = 0; for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) s += e[Math.min(G - 1, Math.max(0, j + dj)) * G + Math.min(G - 1, Math.max(0, i + di))];
+          t[j * G + i] = s / 9;
         }
         e = t;
       }
     };
     blur(z >= 13 ? 3 : z >= 11 ? 2 : 1); // smooths the data's 1 m height steps, which otherwise shade as stripes on flat ground
 
-    // Hillshade (light from the northwest), as translucent dark/light pixels
+    // Hillshade (light from the northwest), baked onto the land color as an opaque image: where
+    // tiles overlap by a pixel they then draw identical pixels, so no seams
     const latC = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 0.5) / 2 ** z)));
     const mpp = 40075016.7 * Math.cos(latC) / (S * 2 ** z);
     const ex = z <= 6 ? 7 : z <= 8 ? 4 : z <= 10 ? 2.5 : 1.6;
     const zen = 45 * rad, az = 135 * rad, flat = Math.cos(zen);
+    const LAND = [31, 35, 39], DARK = [8, 11, 14], LIGHT = [205, 222, 228];
     const img = new Uint8ClampedArray(S * S * 4);
     for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
-      const o = (j * S + i) * 4, h = e[j * S + i];
-      if (h <= 0) continue;
-      const dzdx = (at(i + 1, j) - at(i - 1, j)) / (2 * mpp) * ex, dzdy = (at(i, j + 1) - at(i, j - 1)) / (2 * mpp) * ex;
-      const slope = Math.atan(Math.hypot(dzdx, dzdy)), aspect = Math.atan2(dzdy, -dzdx);
-      const sh = Math.cos(zen) * Math.cos(slope) + Math.sin(zen) * Math.sin(slope) * Math.cos(az - aspect), d = sh - flat;
-      if (d < 0) { img[o] = 8; img[o + 1] = 11; img[o + 2] = 14; img[o + 3] = Math.min(150, -d * 300); }
-      else { img[o] = 205; img[o + 1] = 222; img[o + 2] = 228; img[o + 3] = Math.min(26, d * 70); }
+      const o = (j * S + i) * 4; let col = LAND, a = 0;
+      if (at(i, j) > 0) {
+        const dzdx = (at(i + 1, j) - at(i - 1, j)) / (2 * mpp) * ex, dzdy = (at(i, j + 1) - at(i, j - 1)) / (2 * mpp) * ex;
+        const slope = Math.atan(Math.hypot(dzdx, dzdy)), aspect = Math.atan2(dzdy, -dzdx);
+        const d = Math.cos(zen) * Math.cos(slope) + Math.sin(zen) * Math.sin(slope) * Math.cos(az - aspect) - flat;
+        if (d < 0) { col = DARK; a = Math.min(150, -d * 300) / 255; } else { col = LIGHT; a = Math.min(26, d * 70) / 255; }
+      }
+      img[o] = LAND[0] + (col[0] - LAND[0]) * a; img[o + 1] = LAND[1] + (col[1] - LAND[1]) * a; img[o + 2] = LAND[2] + (col[2] - LAND[2]) * a; img[o + 3] = 255;
     }
     // 5x5 warp grid: tile fractions -> Albers km, so the image can be drawn in small affine pieces
     const grid = new Float32Array(50);
     for (let b = 0; b <= 4; b++) for (let a = 0; a <= 4; a++) { tp(z, x, y, a / 4, b / 4); grid[(b * 5 + a) * 2] = out[0]; grid[(b * 5 + a) * 2 + 1] = out[1]; }
 
-    // Contours on a lightly smoothed grid, padded by one sample so lines reach the tile edge
+    // Contours on the smoothed grid. Samples sit at pixel centres, including one from each
+    // neighbour; each tile owns the cells starting at its pixels -1..254, so the strip along a
+    // shared edge is drawn once, by one tile, and lines continue across the border.
     const iv = INTERVAL[z] || 0, segs = [], major = [];
     if (iv) {
       blur(z >= 12 ? 2 : 1);
-      const G = S + 2, pos = new Float32Array(G);
-      for (let k = 0; k < G; k++) pos[k] = k === 0 ? 0 : k === G - 1 ? 1 : (k - 0.5) / S;
-      const val = (a, b) => at(a - 1, b - 1);
       const emit = (L, ax, ay, bx, by) => {
         const arr = Math.round(L / iv) % 5 === 0 ? major : segs;
         tp(z, x, y, ax, ay); arr.push(out[0], out[1]); tp(z, x, y, bx, by); arr.push(out[0], out[1]);
       };
-      for (let b = 0; b < G - 1; b++) for (let a = 0; a < G - 1; a++) {
-        const v0 = val(a, b), v1 = val(a + 1, b), v2 = val(a + 1, b + 1), v3 = val(a, b + 1);
+      for (let b = -1; b < S - 1; b++) for (let a = -1; a < S - 1; a++) {
+        const v0 = at(a, b), v1 = at(a + 1, b), v2 = at(a + 1, b + 1), v3 = at(a, b + 1);
         const lo = Math.min(v0, v1, v2, v3), hi = Math.max(v0, v1, v2, v3);
         if (hi <= 0) continue;
-        const x0 = pos[a], x1 = pos[a + 1], y0 = pos[b], y1 = pos[b + 1];
+        const x0 = (a + 0.5) / S, x1 = (a + 1.5) / S, y0 = (b + 0.5) / S, y1 = (b + 1.5) / S;
         for (let L = Math.max(iv, Math.ceil(lo / iv) * iv); L <= hi; L += iv) {
           if (L === lo) continue;
           const c = (v0 > L ? 1 : 0) | (v1 > L ? 2 : 0) | (v2 > L ? 4 : 0) | (v3 > L ? 8 : 0);

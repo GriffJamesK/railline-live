@@ -19,7 +19,7 @@ function rendererMain() {
   const mk = (w, h) => typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(globalThis.document.createElement('canvas'), { width: w, height: h });
 
   let COL, MARGIN, DEM_URL, VEC_TILEJSON, L = null, dots = [];
-  let canvas = null, ctx = null, view = null;
+  let canvas = null, ctx = null, view = null, shade = null, sctx = null;
 
   // ---- static layers ----
   function dec(arr, Q) {
@@ -95,7 +95,7 @@ function rendererMain() {
       if (!e.pin && stamp - e.used > 30) { cache.delete(e.key); continue; } // left the view long ago
       const url = (e.kind === 'dem' ? DEM_URL : vecTemplate).replace('{z}', e.z).replace('{x}', e.x).replace('{y}', e.y);
       e.state = 'loading'; inflight++;
-      decoders[rr++ % decoders.length].postMessage({ key: e.key, kind: e.kind, url, z: e.z, x: e.x, y: e.y });
+      decoders[rr++ % decoders.length].postMessage({ key: e.key, kind: e.kind, url, tmpl: DEM_URL, z: e.z, x: e.x, y: e.y });
     }
   }
   function onDecoded(ev) {
@@ -309,15 +309,22 @@ function rendererMain() {
     // Ground detail stays inside the US outline
     c.save(); c.clip(L.land, 'evenodd');
     const box = lonLatBox(x0, y0, x1, y1), kmPer = Math.cos(unproj(vx, vy)[1] * rad);
-    const each = (cov, fn) => {
+    const each = (cov, fn, cc = c) => {
       for (const e of cov.exact) fn(e);
-      for (const f of cov.fills) { c.save(); c.clip(f.clip); fn(f.ent); c.restore(); }
+      for (const f of cov.fills) { cc.save(); cc.clip(f.clip); fn(f.ent); cc.restore(); }
     };
     // Terrain: hillshade everywhere, contours once zoomed in
     const dem = cover('dem', Math.log2(40075 * kmPer * s / 256) - 1, box, 4, 14);
-    c.globalAlpha = 1 - 0.6 * ramp(s, 25, 300);
-    each(dem, e => drawWarped(c, e.img, e.grid));
-    c.globalAlpha = 1;
+    // Shading is drawn into its own layer first (opaque tiles, so overlaps are invisible), then
+    // laid over the land in one pass, fading out when magnified past the data's resolution
+    if (!shade || shade.width !== cw || shade.height !== chh) { shade = mk(cw, chh); sctx = shade.getContext('2d', { alpha: false }); }
+    sctx.setTransform(1, 0, 0, 1, 0, 0); sctx.fillStyle = COL.land; sctx.fillRect(0, 0, cw, chh);
+    sctx.setTransform(c.getTransform()); sctx.imageSmoothingEnabled = true;
+    each(dem, e => drawWarped(sctx, e.img, e.grid), sctx);
+    const M0 = c.getTransform();
+    c.setTransform(1, 0, 0, 1, 0, 0); c.globalAlpha = 1 - 0.6 * ramp(s, 25, 300);
+    c.drawImage(shade, 0, 0);
+    c.globalAlpha = 1; c.setTransform(M0);
     each(dem, e => {
       if (e.minor) { c.strokeStyle = COL.contour + '0.085)'; c.lineWidth = 0.8 * px; c.stroke(e.minor); }
       if (e.major) { c.strokeStyle = COL.contour + '0.16)'; c.lineWidth = 1.1 * px; c.stroke(e.major); }
