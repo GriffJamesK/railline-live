@@ -70,6 +70,9 @@ function tileWorker() {
     const cl = props.class;
     if (layer === 'water' && type === 3) return 'water';
     if (layer === 'waterway' && type === 2) return cl === 'river' ? 'river' : 'stream';
+    // Main-line rail is kept apart from sidings, yards and light rail: it becomes the drawn track up
+    // close and is what trains snap to
+    if (layer === 'transportation' && type === 2 && (cl === 'rail' || cl === 'transit')) return cl === 'rail' && !props.service ? 'rail' : 'railMinor';
     if (layer === 'transportation' && type === 2) return ROAD[cl] || null;
     if (layer === 'building' && type === 3) return 'building';
     if ((layer === 'landcover' && (cl === 'wood' || cl === 'grass')) || (layer === 'park' && type === 3)) return type === 3 ? 'green' : null;

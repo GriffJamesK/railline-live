@@ -118,6 +118,9 @@ function rendererMain() {
           g[k] = p;
         }
         Object.assign(e, { groups: g, state: 'ready' });
+        // Detailed main-line rail goes to the page, which snaps trains onto it
+        const R = m.groups.rail;
+        if (e.z >= 12 && R && R.coords.length) { e.railSent = true; self.postMessage({ type: 'rail', key: e.key, coords: R.coords, starts: R.starts }, [R.coords.buffer, R.starts.buffer]); }
       }
       if (preloading && e.pin) checkPreload();
       if (e.state === 'ready' && e.used >= stamp - 1) requestRender(90);
@@ -129,7 +132,10 @@ function rendererMain() {
       const all = [...cache.values()].filter(e => e.kind === kind);
       if (all.length <= LIMIT[kind]) continue;
       const old = all.filter(e => !e.pin && e.state !== 'loading' && e.state !== 'queued' && e.used < stamp - 2).sort((a, b) => a.used - b.used);
-      for (let i = 0; i < old.length && all.length - i > LIMIT[kind] * 0.85; i++) cache.delete(old[i].key);
+      for (let i = 0; i < old.length && all.length - i > LIMIT[kind] * 0.85; i++) {
+        cache.delete(old[i].key);
+        if (old[i].railSent) self.postMessage({ type: 'railGone', key: old[i].key });
+      }
     }
   }
   const lonLatTile = (lon, lat, z) => {
@@ -362,7 +368,11 @@ function rendererMain() {
     grp('road2', p => { c.strokeStyle = COL.roadMajor + '0.23)'; c.lineWidth = clampW(0.01, 1, 4.6); c.stroke(p); });
     grp('road1', p => { c.strokeStyle = COL.roadMajor + '0.3)'; c.lineWidth = clampW(0.013, 1.3, 6); c.stroke(p); });
     grp('building', p => { c.fillStyle = COL.building; c.fill(p); });
-    grp('rail', p => { c.strokeStyle = COL.track + '0.3)'; c.lineWidth = clampW(0.0025, 0.8, 2); c.stroke(p); });
+    // Up close, OpenStreetMap's main-line rail becomes the drawn track (trains snap onto it on the page)
+    // and the coarser FRA line fades back; sidings and yards stay faint
+    const osm = vec && vec.z >= 12 ? ramp(s, 40, 100) : 0;
+    grp('railMinor', p => { c.strokeStyle = COL.track + (0.16 + 0.06 * osm).toFixed(3) + ')'; c.lineWidth = clampW(0.002, 0.7, 1.6); c.stroke(p); });
+    grp('rail', p => { c.strokeStyle = COL.track + (0.3 + 0.3 * osm).toFixed(3) + ')'; c.lineWidth = osm > 0 ? px * (1.6 + 0.6 * osm) : clampW(0.0025, 0.8, 2); c.stroke(p); });
     c.restore();
     evict(); pump();
 
@@ -387,7 +397,7 @@ function rendererMain() {
       c.stroke(bp);
     }
     c.setLineDash([]);
-    c.strokeStyle = COL.track + (0.38 + 0.2 * ramp(s, 1, 10)).toFixed(3) + ')'; c.lineWidth = px * (s > 30 ? 2.2 : s > 3 ? 1.5 : 1.1); stroke(L.track);
+    c.strokeStyle = COL.track + ((0.38 + 0.2 * ramp(s, 1, 10)) * (1 - 0.75 * osm)).toFixed(3) + ')'; c.lineWidth = px * (s > 30 ? 2.2 : s > 3 ? 1.5 : 1.1); stroke(L.track);
 
     // Station dots in image pixels so they keep a constant size
     c.setTransform(dpr, 0, 0, dpr, 0, 0);

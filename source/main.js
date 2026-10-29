@@ -194,6 +194,82 @@ function pointAt(r, s, out) {
   out[0] = r.xs[i] + (r.xs[i + 1] - r.xs[i]) * t; out[1] = r.ys[i] + (r.ys[i + 1] - r.ys[i]) * t;
   return out;
 }
+// ---------- snapping to OpenStreetMap rail ----------
+// Up close, trains are drawn on OpenStreetMap's main-line rail (which the renderer sends as street
+// tiles load) instead of the coarser FRA line they're routed on. Each route gets an offset profile:
+// sampled every 10 m, each sample moves to the nearest OSM rail running the same way within 45 m,
+// preferring the track the previous sample was on (so trains don't hop across double track), then
+// the offsets are smoothed along the route so they ease in and out. Distances, speeds and stops
+// still come from the routed line; only the drawing moves.
+const rail = { tiles: new Map(), version: 0, grid: null, k: 0 };
+const SNAP_CELL = 0.1, SNAP_STEP = 0.01, SNAP_BLOCK = 200, SNAP_MARGIN = 60, SNAP_R = 0.045;
+function railGrid() {
+  if (rail.grid) return rail.grid;
+  const g = new Map();
+  for (const t of rail.tiles.values()) {
+    const c = t.coords, st = t.starts;
+    for (let k = 0; k < st.length; k++) {
+      const a = st[k], b = k + 1 < st.length ? st[k + 1] : c.length;
+      for (let i = a; i < b - 2; i += 2) {
+        const x0 = c[i], y0 = c[i + 1], x1 = c[i + 2], y1 = c[i + 3];
+        for (let cx = Math.floor(Math.min(x0, x1) / SNAP_CELL); cx <= Math.floor(Math.max(x0, x1) / SNAP_CELL); cx++)
+          for (let cy = Math.floor(Math.min(y0, y1) / SNAP_CELL); cy <= Math.floor(Math.max(y0, y1) / SNAP_CELL); cy++) {
+            const key = cx * 1e6 + cy; let l = g.get(key); if (!l) g.set(key, l = []); l.push(x0, y0, x1, y1);
+          }
+      }
+    }
+  }
+  return (rail.grid = g);
+}
+function snapSample(g, px, py, tx, ty, prefX, prefY, out) { // nearest aligned OSM point to (px,py), scored toward pref
+  let best = Infinity, found = false;
+  const cx0 = Math.floor((px - SNAP_R) / SNAP_CELL), cx1 = Math.floor((px + SNAP_R) / SNAP_CELL), cy0 = Math.floor((py - SNAP_R) / SNAP_CELL), cy1 = Math.floor((py + SNAP_R) / SNAP_CELL);
+  for (let cx = cx0; cx <= cx1; cx++) for (let cy = cy0; cy <= cy1; cy++) {
+    const l = g.get(cx * 1e6 + cy); if (!l) continue;
+    for (let i = 0; i < l.length; i += 4) {
+      const ax = l[i], ay = l[i + 1], dx = l[i + 2] - ax, dy = l[i + 3] - ay, L2 = dx * dx + dy * dy; if (!L2) continue;
+      if (Math.abs(dx * tx + dy * ty) < 0.92 * Math.sqrt(L2)) continue; // must run the same way as the route
+      const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / L2)), qx = ax + dx * t, qy = ay + dy * t;
+      const d = Math.hypot(qx - px, qy - py); if (d > SNAP_R) continue;
+      const score = Math.hypot(qx - prefX, qy - prefY) + 0.25 * d;
+      if (score < best) { best = score; out[0] = qx - px; out[1] = qy - py; found = true; }
+    }
+  }
+  return found;
+}
+function snapBlock(r, b) {
+  if (!r.snap || r.snap.version !== rail.version) r.snap = { version: rail.version, blocks: new Map() };
+  let blk = r.snap.blocks.get(b); if (blk) return blk;
+  const g = railGrid(), i0 = b * SNAP_BLOCK - SNAP_MARGIN, n = SNAP_BLOCK + 2 * SNAP_MARGIN + 1;
+  const raw = new Float32Array(n * 2), o = [0, 0], A = [0, 0], B = [0, 0];
+  let pvx = 0, pvy = 0;
+  for (let j = 0; j < n; j++) {
+    const sAt = (i0 + j) * SNAP_STEP; if (sAt < 0 || sAt > r.total) continue;
+    pointAt(r, sAt - 0.005, A); pointAt(r, sAt + 0.005, B);
+    const tl = Math.hypot(B[0] - A[0], B[1] - A[1]) || 1, tx = (B[0] - A[0]) / tl, ty = (B[1] - A[1]) / tl;
+    const px = (A[0] + B[0]) / 2, py = (A[1] + B[1]) / 2;
+    if (snapSample(g, px, py, tx, ty, px + pvx, py + pvy, o)) { raw[j * 2] = o[0]; raw[j * 2 + 1] = o[1]; pvx = o[0]; pvy = o[1]; }
+    else { pvx *= 0.9; pvy *= 0.9; }
+  }
+  // Smooth along the route (±50 m), so offsets ease in and out instead of stepping
+  const ox = new Float32Array(SNAP_BLOCK + 1), oy = new Float32Array(SNAP_BLOCK + 1), R2 = 5;
+  for (let j = 0; j <= SNAP_BLOCK; j++) {
+    let sx = 0, sy = 0; for (let k = -R2; k <= R2; k++) { const q = (j + SNAP_MARGIN + k) * 2; sx += raw[q]; sy += raw[q + 1]; }
+    ox[j] = sx / (2 * R2 + 1); oy[j] = sy / (2 * R2 + 1);
+  }
+  blk = { ox, oy }; r.snap.blocks.set(b, blk);
+  return blk;
+}
+// Where to draw route position s: the routed point, moved onto OSM rail by the current snap strength
+function placeAt(r, s, out) {
+  pointAt(r, s, out);
+  if (rail.k <= 0) return out;
+  const i = Math.max(0, Math.min(r.total, s)) / SNAP_STEP, b = Math.floor(i / SNAP_BLOCK), blk = snapBlock(r, b);
+  const j = i - b * SNAP_BLOCK, j0 = Math.min(SNAP_BLOCK - 1, Math.floor(j)), f = j - j0;
+  out[0] += (blk.ox[j0] + (blk.ox[j0 + 1] - blk.ox[j0]) * f) * rail.k;
+  out[1] += (blk.oy[j0] + (blk.oy[j0 + 1] - blk.oy[j0]) * f) * rail.k;
+  return out;
+}
 function locate(r, x, y, hint) { // nearest arc-length on route; prefers the window around hint
   const scan = (lo, hi) => {
     let bd = Infinity, bs = 0;
@@ -428,7 +504,7 @@ function stepTrains(dt) {
     MODEL.step(t, dt, now); // after a jump, stops it skipped are dropped by MODEL.arrivals; the one it lands on can still ping
     if (t.gone) continue;
     for (const k of MODEL.arrivals(t)) {
-      pointAt(t.route, t.route.stopS[k], tmpA);
+      placeAt(t.route, t.route.stopS[k], tmpA);
       pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[t.tier] });
       logArrival(t, k);
       announce(t, k);
@@ -511,7 +587,7 @@ function stepFlight(now) {
   const f = flight; if (!f) return false;
   if (!trains.has(f.t.id)) { flight = null; return false; }
   const u = f.dur ? Math.min(1, (now - f.t0) / f.dur) : 1, e = easeInOut(u);
-  pointAt(f.t.route, f.t.sDisp, tmpA);
+  placeAt(f.t.route, f.t.sDisp, tmpA);
   view.s = Math.exp(Math.log(f.s0) + (Math.log(f.s1) - Math.log(f.s0)) * e);
   view.x = tmpA[0] - f.dx * (1 - e) / view.s; view.y = tmpA[1] - f.dy * (1 - e) / view.s;
   lastViewChange = now;
@@ -554,7 +630,9 @@ function startRenderer() {
       m.t0 = performance.now(); base.frames.push(m); trimFrames();
       if (m.settled && !m.preloading) loading.mapReady = true;
       loading.step();
-    } else if (m.type === 'overview') { if (base.overview) closeFrame(base.overview); base.overview = m; }
+    } else if (m.type === 'rail') { rail.tiles.set(m.key, m); rail.version++; rail.grid = null; }
+    else if (m.type === 'railGone') { if (rail.tiles.delete(m.key)) { rail.version++; rail.grid = null; } }
+    else if (m.type === 'overview') { if (base.overview) closeFrame(base.overview); base.overview = m; }
     else if (m.type === 'progress') { loading.tiles = m; loading.step(); }
   };
   // Prefer a worker that can draw off the page; fall back to drawing on the page
@@ -937,16 +1015,16 @@ const trailPts = new Float64Array(4096);
 function routeScreen(r, sa, sb) {
   let n = 0;
   const put = (x, y) => { if (n < trailPts.length - 2) { trailPts[n++] = (x - view.x) * view.s + W / 2; trailPts[n++] = (y - view.y) * view.s + H / 2; } };
-  pointAt(r, sa, tmpA); put(tmpA[0], tmpA[1]);
+  placeAt(r, sa, tmpA); put(tmpA[0], tmpA[1]);
   // Skip route points closer than ~1.5 px on screen (zoomed out, a trail spans hundreds of them),
   // jumping ahead by binary search rather than visiting each one
   const step = 1.5 / view.s;
   for (let i = seg(r, sa) + 1; i < r.xs.length && r.cum[i] < sb;) {
-    put(r.xs[i], r.ys[i]);
+    if (rail.k > 0) { placeAt(r, r.cum[i], tmpA); put(tmpA[0], tmpA[1]); } else put(r.xs[i], r.ys[i]);
     const next = r.cum[i] + step;
     i = i + 1 < r.cum.length && r.cum[i + 1] < next ? Math.max(i + 1, seg(r, next) + 1) : i + 1;
   }
-  pointAt(r, sb, tmpA); put(tmpA[0], tmpA[1]);
+  placeAt(r, sb, tmpA); put(tmpA[0], tmpA[1]);
   return n;
 }
 function strokeRange(c, r, sa, sb, width, rgb, a0, a1) {
@@ -970,7 +1048,7 @@ function drawTrainFx(c, t, G) {
     strokeRange(c, r, s0, tail0, Math.max(1, G.wPx * 0.3), rgb, 0, (trailA * 0.55).toFixed(3));
     strokeRange(c, r, Math.max(s0, tail0 - trailKm * 0.55), tail0, Math.max(1, G.wPx * 0.45), rgb, 0, (trailA * 0.5).toFixed(3));
   }
-  pointAt(r, Math.max(0, head - trainKm / 2), tmpB);
+  placeAt(r, Math.max(0, head - trainKm / 2), tmpB);
   const gx = (tmpB[0] - view.x) * s + W / 2, gy = (tmpB[1] - view.y) * s + H / 2;
   const gr = Math.min(Math.max(70 + 40 * G.near, trainKm * s * 0.6), 260);
   c.globalAlpha = (0.55 + 0.45 * G.far) * a * 0.42;
@@ -996,14 +1074,14 @@ function trainBodies(order, G) {
     const r = t.route, head = t.sDisp, n = G.dot >= 1 ? 0 : t.consist.n, kind = t.consist.kind;
     const fading = t.alpha < 0.999, target = fading ? { loco: new Path2D(), car: new Path2D(), dot: new Path2D(), t } : null;
     if (fading) solo.push(target);
-    pointAt(r, head, tmpA);
+    placeAt(r, head, tmpA);
     let hx = (tmpA[0] - view.x) * s + W / 2, hy = (tmpA[1] - view.y) * s + H / 2;
     const pts = [hx, hy]; let x0 = hx, x1 = hx, y0 = hy, y1 = hy;
     if (G.dot > 0) { const d = fading ? target.dot : (dots[t.tier] || (dots[t.tier] = new Path2D())); d.moveTo(hx + DOT_R, hy); d.arc(hx, hy, DOT_R, 0, Math.PI * 2); }
     for (let i = 0; i < n; i++) {
       const sa = head - i * (G.carKm + G.gapKm), sb = sa - G.carKm;
       if (sa <= 0) break;
-      pointAt(r, sa, tmpA); pointAt(r, Math.max(0, sb), tmpB);
+      placeAt(r, sa, tmpA); placeAt(r, Math.max(0, sb), tmpB);
       const ax = (tmpA[0] - view.x) * s + W / 2, ay = (tmpA[1] - view.y) * s + H / 2;
       const bx = (tmpB[0] - view.x) * s + W / 2, by = (tmpB[1] - view.y) * s + H / 2;
       pts.push(bx, by); x0 = Math.min(x0, bx); x1 = Math.max(x1, bx); y0 = Math.min(y0, by); y1 = Math.max(y1, by);
@@ -1102,13 +1180,14 @@ function frame(now) {
     const t = trains.get(follow);
     if (!t) setFollow(null);
     else {
-      pointAt(t.route, t.sDisp, tmpA);
+      placeAt(t.route, t.sDisp, tmpA);
       const k = Math.min(1, dt * 4), mx = (tmpA[0] - view.x) * k, my = (tmpA[1] - view.y) * k;
       view.x += mx; view.y += my;
       if (Math.hypot(mx, my) * view.s > 2) lastViewChange = now; // still flying to the train: treat as moving
       if (goal.active) { goal.ax = view.x; goal.ay = view.y; goal.sx = W / 2; goal.sy = H / 2; } }
   }
   applyZoom(Math.min(1, dt * 9));
+  rail.k = rail.tiles.size ? ramp(view.s, 40, 100) : 0; // snap onto OSM rail over the same zooms its tiles take over
   const viewChanged = view.x !== lastVX || view.y !== lastVY || view.s !== lastVS;
   if (viewChanged) { lastVX = view.x; lastVY = view.y; lastVS = view.s; if (!follow || goal.active || drag || pinch) lastViewChange = now; hoverDirty = true; }
   requestBase(now);
