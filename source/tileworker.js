@@ -147,23 +147,24 @@ function tileWorker() {
     };
     blur(z >= 13 ? 3 : z >= 11 ? 2 : 1); // smooths the data's 1 m height steps, which otherwise shade as stripes on flat ground
 
-    // Hillshade (light from the northwest), baked onto the land color as an opaque image: where
-    // tiles overlap by a pixel they then draw identical pixels, so no seams
+    // Hillshade (light from the northwest) as an opaque grey image, 128 = flat. The renderer lays it
+    // over the land with a hard-light blend, so it works for any land color (dark or light theme), and
+    // where tiles overlap by a pixel they draw identical pixels, so there are no seams.
     const latC = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 0.5) / 2 ** z)));
     const mpp = 40075016.7 * Math.cos(latC) / (S * 2 ** z);
     const ex = z <= 6 ? 7 : z <= 8 ? 4 : z <= 10 ? 2.5 : 1.6;
     const zen = 45 * rad, az = 135 * rad, flat = Math.cos(zen);
-    const LAND = [31, 35, 39], DARK = [8, 11, 14], LIGHT = [205, 222, 228];
     const img = new Uint8ClampedArray(S * S * 4);
     for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
-      const o = (j * S + i) * 4; let col = LAND, a = 0;
+      const o = (j * S + i) * 4; let g = 128;
       if (at(i, j) > 0) {
         const dzdx = (at(i + 1, j) - at(i - 1, j)) / (2 * mpp) * ex, dzdy = (at(i, j + 1) - at(i, j - 1)) / (2 * mpp) * ex;
         const slope = Math.atan(Math.hypot(dzdx, dzdy)), aspect = Math.atan2(dzdy, -dzdx);
         const d = Math.cos(zen) * Math.cos(slope) + Math.sin(zen) * Math.sin(slope) * Math.cos(az - aspect) - flat;
-        if (d < 0) { col = DARK; a = Math.min(150, -d * 300) / 255; } else { col = LIGHT; a = Math.min(26, d * 70) / 255; }
+        // shadow: multiply the land by down to ~0.56; highlight: screen it by up to ~0.08
+        g = d < 0 ? 127.5 * (1 - 0.74 * Math.min(150, -d * 300) / 255) : 127.5 + 99 * Math.min(26, d * 70) / 255;
       }
-      img[o] = LAND[0] + (col[0] - LAND[0]) * a; img[o + 1] = LAND[1] + (col[1] - LAND[1]) * a; img[o + 2] = LAND[2] + (col[2] - LAND[2]) * a; img[o + 3] = 255;
+      img[o] = img[o + 1] = img[o + 2] = g; img[o + 3] = 255;
     }
     // 5x5 warp grid: tile fractions -> Albers km, so the image can be drawn in small affine pieces
     const grid = new Float32Array(50);

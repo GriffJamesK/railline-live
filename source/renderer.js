@@ -318,12 +318,12 @@ function rendererMain() {
     // Shading is drawn into its own layer first (opaque tiles, so overlaps are invisible), then
     // laid over the land in one pass, fading out when magnified past the data's resolution
     if (!shade || shade.width !== cw || shade.height !== chh) { shade = mk(cw, chh); sctx = shade.getContext('2d', { alpha: false }); }
-    sctx.setTransform(1, 0, 0, 1, 0, 0); sctx.fillStyle = COL.land; sctx.fillRect(0, 0, cw, chh);
+    sctx.setTransform(1, 0, 0, 1, 0, 0); sctx.fillStyle = '#808080'; sctx.fillRect(0, 0, cw, chh);
     sctx.setTransform(c.getTransform()); sctx.imageSmoothingEnabled = true;
     each(dem, e => drawWarped(sctx, e.img, e.grid), sctx);
     const M0 = c.getTransform();
-    c.setTransform(1, 0, 0, 1, 0, 0); c.globalAlpha = 1 - 0.6 * ramp(s, 25, 300);
-    c.drawImage(shade, 0, 0);
+    c.setTransform(1, 0, 0, 1, 0, 0); c.globalAlpha = COL.shade * (1 - 0.6 * ramp(s, 25, 300));
+    c.globalCompositeOperation = 'hard-light'; c.drawImage(shade, 0, 0); c.globalCompositeOperation = 'source-over';
     c.globalAlpha = 1; c.setTransform(M0);
     each(dem, e => {
       if (e.minor) { c.strokeStyle = COL.contour + '0.085)'; c.lineWidth = 0.8 * px; c.stroke(e.minor); }
@@ -425,5 +425,6 @@ function rendererMain() {
     if (m.type === 'init') init(m);
     else if (m.type === 'view') { view = m; if (m.render) requestRender(0); }
     else if (m.type === 'prefetch') prefetch(m);
+    else if (m.type === 'theme') { COL = m.COL; requestRender(0); }
   };
 }

@@ -384,6 +384,7 @@ function stepTrains(dt) {
       pointAt(t.route, t.route.stopS[k], tmpA);
       pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[t.tier] });
       logArrival(t, k);
+      announce(t, k);
     }
   }
 }
@@ -404,6 +405,15 @@ function renderDebug() {
     d.textContent = `${e.at.toLocaleTimeString()} · ${e.train} · ${e.stop} · feed: ${e.status}, arr ${e.arr} (sched ${e.sched}) · report ${e.report} · drawn ${e.gap} km from report`;
     return d;
   })));
+}
+// Arrival announcements: a quiet line in the top-right corner that fades after a few seconds
+function announce(t, k) {
+  const box = $('toasts'), s = t.stops && t.stops[k], i = t.info; if (!box || !s) return;
+  const el = document.createElement('div');
+  el.textContent = `${i.routeName || 'Train'} ${i.trainNum} arrived at ${placeName(s.name, s.code)}`;
+  el.addEventListener('animationend', () => el.remove());
+  box.prepend(el);
+  while (box.children.length > 4) box.lastElementChild.remove();
 }
 function markPassed(t) { t.route.stopS.forEach((ss, k) => { if (ss <= t.sDisp + 0.08) t.pinged.add(k); }); }
 
@@ -431,7 +441,30 @@ function resize() {
 const toScreen = (x, y) => [(x - view.x) * view.s + W / 2, (y - view.y) * view.s + H / 2];
 const toWorld = (sx, sy) => [(sx - W / 2) / view.s + view.x, (sy - H / 2) / view.s + view.y];
 
+// Camera flight onto a train: zoom and pan together, with the train sliding in a straight line from
+// where it is on screen to the center as the view zooms, so it never leaves the frame
+let flight = null;
+const easeInOut = (u) => u < 0.5 ? 4 * u * u * u : 1 - (-2 * u + 2) ** 3 / 2;
+function flyTo(t, sTarget) {
+  pointAt(t.route, t.sDisp, tmpA);
+  goal.active = false;
+  const zoomSteps = Math.abs(Math.log2(sTarget / view.s));
+  flight = { t, t0: performance.now(), dur: reduceMotion ? 0 : 700 + 160 * Math.min(4, zoomSteps),
+    s0: view.s, s1: sTarget, dx: (tmpA[0] - view.x) * view.s, dy: (tmpA[1] - view.y) * view.s };
+}
+function stepFlight(now) {
+  const f = flight; if (!f) return false;
+  if (!trains.has(f.t.id)) { flight = null; return false; }
+  const u = f.dur ? Math.min(1, (now - f.t0) / f.dur) : 1, e = easeInOut(u);
+  pointAt(f.t.route, f.t.sDisp, tmpA);
+  view.s = Math.exp(Math.log(f.s0) + (Math.log(f.s1) - Math.log(f.s0)) * e);
+  view.x = tmpA[0] - f.dx * (1 - e) / view.s; view.y = tmpA[1] - f.dy * (1 - e) / view.s;
+  lastViewChange = now;
+  if (u >= 1) flight = null;
+  return true;
+}
 function zoomAt(factor, sx, sy) {
+  flight = null;
   const ns = Math.max(minS, Math.min(maxS, (goal.active ? goal.s : view.s) * factor));
   const [wx, wy] = toWorld(sx, sy);
   Object.assign(goal, { s: ns, ax: wx, ay: wy, sx, sy, active: true });
@@ -455,7 +488,7 @@ function startRenderer() {
   const tileURL = URL.createObjectURL(new Blob([tileSrc], { type: 'text/javascript' }));
   const init = {
     type: 'init', geo: GEO, tileURL, tileSrc, MARGIN, DEM_URL, VEC_TILEJSON,
-    COL: { ground: COL.ground, land: COL.land, coast: COL.coast, border: COL.border, roadMajor: COL.roadMajor, roadMinor: COL.roadMinor, track: COL.track, water: COL.water, contour: COL.contour, building: COL.building, green: COL.green, station: COL.station },
+    COL: rendererColors(),
     dots: stationDots.flatMap(d => [d.x, d.y]),
   };
   const onMsg = (ev) => {
@@ -489,7 +522,8 @@ function requestBase(now) {
   const interactive = goal.active || !!drag || !!pinch || now - lastViewChange < 160;
   // During an animated zoom, paint where the zoom is headed: the result is ready on arrival, and
   // when zooming out it already covers the screen while the animation plays
-  const tv = goal.active && !follow ? { s: goal.s, x: goal.ax - (goal.sx - W / 2) / goal.s, y: goal.ay - (goal.sy - H / 2) / goal.s } : view;
+  let tv = goal.active && !follow ? { s: goal.s, x: goal.ax - (goal.sx - W / 2) / goal.s, y: goal.ay - (goal.sy - H / 2) / goal.s } : view;
+  if (flight) { pointAt(flight.t.route, flight.t.sDisp, tmpB); tv = { s: flight.s1, x: tmpB[0], y: tmpB[1] }; } // paint where the flight ends
   const r = base.sent;
   let need = base.force || !r;
   if (r) {
@@ -550,7 +584,7 @@ canvas.addEventListener('pointermove', (e) => {
   }
   if (drag) {
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
-    if (Math.abs(dx) + Math.abs(dy) > (e.pointerType === 'mouse' ? 6 : 10)) { moved = true; canvas.classList.add('dragging'); if (follow) setFollow(null); }
+    if (Math.abs(dx) + Math.abs(dy) > (e.pointerType === 'mouse' ? 6 : 10)) { moved = true; canvas.classList.add('dragging'); flight = null; if (follow) setFollow(null); }
     if (moved) { view.x = drag.vx - dx / view.s; view.y = drag.vy - dy / view.s; goal.active = false; }
     return;
   }
@@ -565,7 +599,7 @@ const endPointer = (e) => {
 canvas.addEventListener('pointerup', (e) => {
   if (!moved) {
     const t = pick(e.clientX, e.clientY);
-    if (t) { setFollow(t); if (view.s < 6) zoomAt(Math.min(40, 18 / view.s), e.clientX, e.clientY); }
+    if (t) { setFollow(t); flyTo(t, view.s < 6 ? Math.min(view.s * 40, 18) : view.s); }
   }
   endPointer(e);
 });
@@ -627,8 +661,7 @@ function selectTrain(t) {
     goal.active = false; view.x = tmpA[0]; view.y = tmpA[1]; base.force = true;
   }
   setFollow(t);
-  const target = Math.max(view.s, 40);
-  if (target !== view.s) zoomAt(target / view.s, W / 2, H / 2);
+  flyTo(t, Math.max(view.s, 40));
   openList(false);
 }
 
@@ -745,6 +778,14 @@ function renderInfo(now) {
   $('infoBar').style.transform = `scaleX(${pct / 100})`;
   $('infoBar').style.background = `rgb(${RGB[t.tier]})`;
   $('infoRows').className = 'rows ' + t.tier;
+  // Distance along the track to the next stop the train hasn't reached
+  const at = (t.stopStatus || []).includes('Station'); // standing at a stop: the panel already says "Now at"
+  const ni = (t.stopStatus || []).indexOf('Enroute');
+  let k = ni < 0 ? -1 : ni; while (k >= 0 && k < t.route.stopS.length && t.route.stopS[k] <= t.sDisp + 0.05) k++;
+  if (!at && k >= 0 && k < t.route.stopS.length) {
+    const mi = (t.route.stopS[k] - t.sDisp) / 1.609344;
+    f.rows.splice(2, 0, f.row('Distance to stop', mi < 0.1 ? 'Arriving' : `${mi < 10 ? mi.toFixed(1) : Math.round(mi)} mi`));
+  }
   $('infoRows').replaceChildren(...f.rows);
   // Fetch detail ahead of the train so following never outruns the map
   const pts = [], r = t.route, reach = (Math.max(W, H) * 1.5) / view.s;
@@ -757,13 +798,42 @@ function renderInfo(now) {
 /*__RENDERER__*/
 
 // ---------- trains ----------
-const COL = {
-  ground: '#15181b', land: '#1f2327', coast: 'rgba(120,140,150,0.30)', border: 'rgba(150,172,182,0.34)',
-  roadMajor: 'rgba(150,165,175,', roadMinor: 'rgba(140,155,165,', track: 'rgba(110,150,165,',
-  water: 'rgba(96,140,160,', contour: 'rgba(150,176,186,', building: 'rgba(160,182,192,0.075)', green: 'rgba(120,160,150,0.035)',
-  station: 'rgba(196,214,220,', car: '#dfeef0',
+// Map and train colors per theme (the page's own colors are CSS tokens that switch with it)
+const THEMES = {
+  dark: {
+    COL: {
+      ground: '#15181b', land: '#1f2327', coast: 'rgba(120,140,150,0.30)', border: 'rgba(150,172,182,0.34)',
+      roadMajor: 'rgba(150,165,175,', roadMinor: 'rgba(140,155,165,', track: 'rgba(110,150,165,',
+      water: 'rgba(96,140,160,', contour: 'rgba(150,176,186,', building: 'rgba(160,182,192,0.075)', green: 'rgba(120,160,150,0.035)',
+      station: 'rgba(196,214,220,', shade: 1, car: '#dfeef0', ring: 'rgba(21,24,27,0.9)', hoverRing: 'rgba(228,238,240,0.7)',
+    },
+    RGB: { ok: '99,197,191', late: '227,168,107', vlate: '226,114,124' },
+  },
+  light: {
+    COL: {
+      ground: '#d9e1e5', land: '#f1f3f4', coast: 'rgba(80,100,110,0.35)', border: 'rgba(70,90,100,0.42)',
+      roadMajor: 'rgba(90,105,115,', roadMinor: 'rgba(100,115,125,', track: 'rgba(40,105,120,',
+      water: 'rgba(60,115,140,', contour: 'rgba(70,95,105,', building: 'rgba(70,90,100,0.09)', green: 'rgba(90,150,115,0.07)',
+      station: 'rgba(45,65,75,', shade: 0.6, car: '#2f3e45', ring: 'rgba(241,243,244,0.95)', hoverRing: 'rgba(30,45,52,0.75)',
+    },
+    RGB: { ok: '30,143,137', late: '199,122,40', vlate: '200,70,84' },
+  },
 };
-const RGB = { ok: '99,197,191', late: '227,168,107', vlate: '226,114,124' };
+let theme = 'dark';
+try { if (localStorage.getItem('rail-live-theme') === 'light') theme = 'light'; } catch (_) { /* default theme */ }
+const COL = { ...THEMES[theme].COL }, RGB = { ...THEMES[theme].RGB };
+document.documentElement.dataset.theme = theme;
+const rendererColors = () => { const { car, ring, hoverRing, ...rest } = COL; return rest; };
+function setTheme(name) {
+  theme = name; document.documentElement.dataset.theme = name;
+  Object.assign(COL, THEMES[name].COL); Object.assign(RGB, THEMES[name].RGB);
+  for (const k of Object.keys(sprites)) delete sprites[k];
+  base.worker.postMessage({ type: 'theme', COL: rendererColors() });
+  base.force = true;
+  const b = $('themeBtn'); b.setAttribute('aria-label', name === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'); b.setAttribute('aria-pressed', String(name === 'light'));
+  try { localStorage.setItem('rail-live-theme', name); } catch (_) { /* not remembered */ }
+  infoAt = 0; renderList();
+}
 const ramp = (v, a, b) => Math.max(0, Math.min(1, (v - a) / (b - a)));
 const sprites = {};
 function glowSprite(t) {
@@ -870,7 +940,7 @@ function drawTrains(order) {
   const G = geom(view.s), carA = 1 - G.dot;
   const { batch, dots, solo } = trainBodies(order, G);
   const fillDots = (p, rgb, a) => { // a thin ground-colored ring keeps overlapping dots distinct
-    ctx.globalAlpha = a; ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(21,24,27,0.9)'; ctx.stroke(p);
+    ctx.globalAlpha = a; ctx.lineWidth = 2; ctx.strokeStyle = COL.ring; ctx.stroke(p);
     ctx.fillStyle = `rgb(${rgb})`; ctx.fill(p); ctx.globalAlpha = 1;
   };
   if (carA > 0) {
@@ -947,7 +1017,8 @@ let lastT = performance.now(), lastVX = NaN, lastVY = NaN, lastVS = NaN, clipCac
 function frame(now) {
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
   stepTrains(dt);
-  if (follow) {
+  if (stepFlight(now)) { /* the flight moves the camera */ }
+  else if (follow) {
     const t = trains.get(follow);
     if (!t) setFollow(null);
     else {
@@ -1001,7 +1072,7 @@ function frame(now) {
   if (sel && sel !== fol && order.includes(sel)) drawSelected(sel);
   if (hoveredStation) {
     const p = toScreen(hoveredStation.x, hoveredStation.y);
-    ctx.strokeStyle = 'rgba(228,238,240,0.7)'; ctx.lineWidth = 1.2;
+    ctx.strokeStyle = COL.hoverRing; ctx.lineWidth = 1.2;
     ctx.beginPath(); ctx.arc(p[0], p[1], 5, 0, Math.PI * 2); ctx.stroke();
   }
   // Hover is re-checked when the pointer or map moves, and a few times a second as trains move
@@ -1012,6 +1083,9 @@ function frame(now) {
 
 resize();
 if (DEBUG) renderDebug();
+$('themeBtn').onclick = () => setTheme(theme === 'dark' ? 'light' : 'dark');
+$('themeBtn').setAttribute('aria-label', theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode');
+$('themeBtn').setAttribute('aria-pressed', String(theme === 'light'));
 startRenderer();
 requestAnimationFrame(frame);
 poll();
