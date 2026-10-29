@@ -17,7 +17,7 @@
   --accent: #63c5bf;   /* on-time trains, trails */
   --late: #e3a86b;     /* trains running 15+ minutes late */
   --very-late: #e2727c; /* trains running an hour or more late */
-  --panel: rgba(30, 35, 39, 0.82);
+  --panel: rgba(29, 33, 37, 0.94);
   --hair: rgba(150, 175, 185, 0.16);
   --font-ui: "Barlow", "Helvetica Neue", Arial, sans-serif;
   --font-data: "JetBrains Mono", ui-monospace, Menlo, monospace;
@@ -32,7 +32,7 @@ canvas.over-train { cursor: pointer; }
 
 .card {
   position: fixed; background: var(--panel); border: 1px solid var(--hair); border-radius: 10px;
-  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
 }
 #status {
   top: calc(16px + env(safe-area-inset-top, 0px)); left: max(16px, env(safe-area-inset-left, 0px));
@@ -49,8 +49,8 @@ canvas.over-train { cursor: pointer; }
 #msg { font-size: 12px; color: var(--late); max-width: 260px; }
 
 #tip {
-  padding: 10px 12px; pointer-events: none; display: grid; gap: 4px; min-width: 190px; max-width: 260px;
-  transform: translate(14px, 14px);
+  left: 0; top: 0; padding: 10px 12px; pointer-events: none; display: grid; gap: 4px; min-width: 190px; max-width: 260px;
+  will-change: transform;
 }
 .late b.d { color: var(--late); }
 .vlate b.d { color: var(--very-late); }
@@ -70,11 +70,11 @@ canvas.over-train { cursor: pointer; }
 #info .ttl { font-size: 16px; }
 #info .route { font-size: 12px; color: var(--ink-dim); }
 .bar { height: 3px; border-radius: 2px; background: var(--hair); overflow: hidden; }
-.bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
+.bar i { display: block; height: 100%; width: 100%; background: var(--accent); border-radius: 2px; transform-origin: left; transform: scaleX(0); }
 #info button { justify-self: start; background: none; border: 1px solid var(--hair); color: var(--ink); border-radius: 6px; padding: 4px 10px; font: 12px var(--font-ui); cursor: pointer; }
 #info button:hover { background: rgba(255,255,255,.05); }
 #info button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-#stip { padding: 5px 9px; pointer-events: none; font-size: 12px; white-space: nowrap; transform: translate(-50%, calc(-100% - 10px)); }
+#stip { left: 0; top: 0; padding: 5px 9px; pointer-events: none; font-size: 12px; white-space: nowrap; will-change: transform; }
 #stip span { color: var(--ink-dim); font: 11px var(--font-data); margin-left: 6px; }
 
 #zoom {
@@ -90,6 +90,17 @@ canvas.over-train { cursor: pointer; }
 .credit { position: fixed; right: max(66px, calc(env(safe-area-inset-right, 0px) + 66px)); bottom: calc(16px + env(safe-area-inset-bottom, 0px)); font-size: 11px; color: #5c686f; }
 .credit a { color: inherit; }
 .credit { max-width: calc(100vw - 380px); text-align: right; }
+#veil {
+  position: fixed; inset: 0; z-index: 20; background: var(--ground); display: grid; place-items: center;
+  transition: opacity 0.7s ease;
+}
+#veil.gone { opacity: 0; pointer-events: none; }
+#veil .in { display: grid; gap: 14px; width: min(260px, calc(100vw - 64px)); }
+#veil .t { font-size: 18px; font-weight: 600; letter-spacing: 0.02em; }
+#veil .t span { color: var(--ink-dim); font-weight: 400; }
+#veil .bar i { transition: transform 0.4s ease; }
+#veilMsg { font: 12px var(--font-data); color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) { #veil, #veil .bar i { transition: none; } }
 @media (max-width: 520px) { .credit { display: none; } #status { min-width: 0; } #info { width: auto; right: 70px; } }
 </style>
 </head>
@@ -103,6 +114,7 @@ canvas.over-train { cursor: pointer; }
   <div id="msg" hidden></div>
 </div>
 <div id="tip" class="card" hidden></div>
+<div id="veil"><div class="in"><div class="t">Railline <span>live</span></div><div class="bar"><i id="veilBar"></i></div><div id="veilMsg">Loading map</div></div></div>
 <div id="stip" class="card" hidden></div>
 <div id="info" class="card" hidden aria-live="polite">
   <div class="head"><span class="eyebrow">Following</span><span class="eyebrow" id="infoPct"></span></div>
@@ -126,6 +138,10 @@ canvas.over-train { cursor: pointer; }
 const API = 'https://api.amtraker.com/v3';
 const POLL_MS = 30000;
 const MPH = 1.609344 / 3600; // mph -> km/s
+const DEM_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
+const VEC_TILEJSON = 'https://tiles.openfreemap.org/planet';
+const MARGIN = 256; // the base map image extends this far past each screen edge (CSS px)
+const $ = (id) => document.getElementById(id);
 
 // ---------- projection (must match the build step) ----------
 const R = 6371, rad = Math.PI / 180;
@@ -137,52 +153,57 @@ function project(lon, lat) {
   return [R * r * Math.sin(t), -R * (RHO0 - r * Math.cos(t))];
 }
 
-function unproject(x, y) {
-  const X = x / R, Y = -y / R, rho = Math.sign(N) * Math.hypot(X, RHO0 - Y), th = Math.atan2(X, RHO0 - Y);
-  return [(L0 + th / N) / rad, Math.asin(Math.max(-1, Math.min(1, (C - rho * rho * N * N) / (2 * N)))) / rad];
-}
-
-// ---------- decode embedded geometry ----------
+// ---------- geometry the page itself needs (the renderer has its own copy of the rest) ----------
 const Q = GEO.q;
 function dec(arr) {
   const out = new Float32Array(arr.length); let x = 0, y = 0;
   for (let i = 0; i < arr.length; i += 2) { x += arr[i]; y += arr[i + 1]; out[i] = x * Q; out[i + 1] = y * Q; }
   return out;
 }
-function toPath(lines, close) {
+function simplify(a, tol) { // Douglas–Peucker on a flat [x,y,...] ring
+  const n = a.length / 2; if (n < 4) return a;
+  const keep = new Uint8Array(n); keep[0] = keep[n - 1] = 1;
+  const st = [[0, n - 1]];
+  while (st.length) {
+    const [i, j] = st.pop(), ax = a[i * 2], ay = a[i * 2 + 1], dx = a[j * 2] - ax, dy = a[j * 2 + 1] - ay, L2 = dx * dx + dy * dy || 1e-12;
+    let md = 0, mi = -1;
+    for (let k = i + 1; k < j; k++) {
+      let t = ((a[k * 2] - ax) * dx + (a[k * 2 + 1] - ay) * dy) / L2; t = Math.max(0, Math.min(1, t));
+      const ex = ax + t * dx - a[k * 2], ey = ay + t * dy - a[k * 2 + 1], d = ex * ex + ey * ey;
+      if (d > md) { md = d; mi = k; }
+    }
+    if (md > tol * tol) { keep[mi] = 1; st.push([i, mi], [mi, j]); }
+  }
+  const out = []; for (let k = 0; k < n; k++) if (keep[k]) out.push(a[k * 2], a[k * 2 + 1]);
+  return out;
+}
+const landRings = GEO.land.map(dec);
+function ringsPath(rings, tol) {
   const p = new Path2D();
-  for (const l of lines) {
-    const a = dec(l); p.moveTo(a[0], a[1]);
-    for (let i = 2; i < a.length; i += 2) p.lineTo(a[i], a[i + 1]);
-    if (close) p.closePath();
+  for (const r0 of rings) {
+    const r = tol ? simplify(r0, tol) : r0; if (r.length < 6) continue;
+    p.moveTo(r[0], r[1]); for (let i = 2; i < r.length; i += 2) p.lineTo(r[i], r[i + 1]); p.closePath();
   }
   return p;
 }
-// A line layer keeps one whole-country path for far zooms, plus small bounded chunks so close
-// zooms only stroke what is on screen (stroking the whole country at street scale is very slow).
-const CHUNK = 40;
-function toLayer(polylines) {
-  const all = new Path2D(), chunks = [];
-  for (const a of polylines) {
-    all.moveTo(a[0], a[1]); for (let i = 2; i < a.length; i += 2) all.lineTo(a[i], a[i + 1]);
-    for (let st = 0; st < a.length - 2; st += CHUNK * 2) {
-      const end = Math.min(a.length, st + CHUNK * 2 + 2), p = new Path2D();
-      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-      for (let i = st; i < end; i += 2) {
-        const x = a[i], y = a[i + 1]; i === st ? p.moveTo(x, y) : p.lineTo(x, y);
-        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-      }
-      chunks.push({ p, a: a.subarray(st, end), x0, y0, x1, y1 });
-    }
-  }
-  return { all, chunks };
+// The US outline at three levels of detail, for clipping glows cheaply at every zoom
+const landLOD = [ringsPath(landRings, 3), ringsPath(landRings, 0.8), ringsPath(landRings, 0)];
+const landClip = (s) => landLOD[s < 0.8 ? 0 : s < 4 ? 1 : 2];
+// Bounding boxes of the coast/border outline, to know when a view needs clipping at all
+const coastBoxes = [];
+for (const a of GEO.coast.map(dec)) for (let st = 0; st < a.length - 2; st += 80) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (let i = st; i < Math.min(a.length, st + 82); i += 2) { x0 = Math.min(x0, a[i]); x1 = Math.max(x1, a[i]); y0 = Math.min(y0, a[i + 1]); y1 = Math.max(y1, a[i + 1]); }
+  coastBoxes.push([x0, y0, x1, y1]);
 }
-const layers = {
-  land: toPath(GEO.land, true), coast: toLayer(GEO.coast.map(dec)), borders: toLayer(GEO.borders.map(dec)),
-  roadsMajor: toLayer(GEO.roadsMajor.map(dec)), roadsMinor: toLayer(GEO.roadsMinor.map(dec)),
-  riversMajor: toLayer(GEO.riversMajor.map(dec)), riversMinor: toLayer(GEO.riversMinor.map(dec)),
-  lakes: toPath(GEO.lakes, true),
-};
+const hitCtx = document.createElement('canvas').getContext('2d');
+const landOutline = (() => { const p = new Path2D(); for (const a of GEO.coast.map(dec)) { p.moveTo(a[0], a[1]); for (let i = 2; i < a.length; i += 2) p.lineTo(a[i], a[i + 1]); } return p; })();
+// A train is drawn only while its reported position is on US land (or within a few km of the
+// coast or border, so lakeshore and coastal running isn't dropped)
+function inUS(x, y) {
+  if (hitCtx.isPointInPath(landLOD[2], x, y, 'evenodd')) return true;
+  hitCtx.lineWidth = 6; return hitCtx.isPointInStroke(landOutline, x, y);
+}
 
 // Track graph
 const nodes = GEO.nodes.map(([x, y]) => [x * Q, y * Q]);
@@ -192,29 +213,7 @@ const edges = GEO.edges.map(([a, b, d]) => {
   return { a, b, pts, len };
 });
 const adj = nodes.map(() => []);
-edges.forEach((e, i) => { adj[e.a].push([i, e.b]); adj[e.b].push([i, e.a]); });
-layers.track = toLayer(edges.map(e => e.pts));
-
-// Liang–Barsky: parametric [t0, t1] of a segment inside a rectangle, or null
-function clipSeg(ax, ay, bx, by, x0, y0, x1, y1) {
-  let t0 = 0, t1 = 1; const dx = bx - ax, dy = by - ay;
-  const P = [-dx, dx, -dy, dy], Qv = [ax - x0, x1 - ax, ay - y0, y1 - ay];
-  for (let i = 0; i < 4; i++) {
-    if (P[i] === 0) { if (Qv[i] < 0) return null; continue; }
-    const r = Qv[i] / P[i];
-    if (P[i] < 0) { if (r > t1) return null; if (r > t0) t0 = r; } else { if (r < t0) return null; if (r < t1) t1 = r; }
-  }
-  return [t0, t1];
-}
-
-// US-only filter: a train is drawn only while its reported position is on US land (or within
-// a few km of the coast/border, so lakeshore and coastal running isn't dropped)
-const hitCtx = document.createElement('canvas').getContext('2d');
-const landOutline = toPath(GEO.coast);
-function inUS(x, y) {
-  if (hitCtx.isPointInPath(layers.land, x, y, 'evenodd')) return true;
-  hitCtx.lineWidth = 6; return hitCtx.isPointInStroke(landOutline, x, y);
-}
+edges.forEach((e, i) => { adj[e.a].push(i, e.b); adj[e.b].push(i, e.a); });
 
 // Stations: code -> {node, x, y}; node -1 means off the embedded network
 const stations = {};
@@ -227,19 +226,30 @@ const stationDots = Object.entries(GEO.stationNames).filter(([c]) => stations[c]
 });
 
 // ---------- routing ----------
+// Shortest track path between two graph nodes; results are cached per station pair because
+// many trains share the same corridors
+const pairCache = new Map();
 function dijkstra(src, dst) {
-  if (src === dst) return [];
-  const dist = new Float64Array(nodes.length).fill(Infinity), prev = new Int32Array(nodes.length).fill(-1), prevE = new Int32Array(nodes.length);
-  const heap = [[0, src]]; dist[src] = 0;
-  const push = (it) => { heap.push(it); let i = heap.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (heap[p][0] <= heap[i][0]) break; [heap[p], heap[i]] = [heap[i], heap[p]]; i = p; } };
-  const pop = () => { const top = heap[0], last = heap.pop(); if (heap.length) { heap[0] = last; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < heap.length && heap[l][0] < heap[m][0]) m = l; if (r < heap.length && heap[r][0] < heap[m][0]) m = r; if (m === i) break; [heap[m], heap[i]] = [heap[i], heap[m]]; i = m; } } return top; };
-  while (heap.length) {
+  if (src === dst) return { steps: [], len: 0 };
+  const key = src + '>' + dst; if (pairCache.has(key)) return pairCache.get(key);
+  const n = nodes.length, dist = new Float64Array(n).fill(Infinity), prev = new Int32Array(n).fill(-1), prevE = new Int32Array(n);
+  const hd = [], hn = []; // binary heap as parallel arrays
+  const push = (d, v) => { hd.push(d); hn.push(v); let i = hd.length - 1; while (i > 0) { const p = (i - 1) >> 1; if (hd[p] <= hd[i]) break; [hd[p], hd[i]] = [hd[i], hd[p]]; [hn[p], hn[i]] = [hn[i], hn[p]]; i = p; } };
+  const pop = () => {
+    const d = hd[0], v = hn[0], ld = hd.pop(), lv = hn.pop();
+    if (hd.length) { hd[0] = ld; hn[0] = lv; let i = 0; for (;;) { const l = 2 * i + 1, r = l + 1; let m = i; if (l < hd.length && hd[l] < hd[m]) m = l; if (r < hd.length && hd[r] < hd[m]) m = r; if (m === i) break; [hd[m], hd[i]] = [hd[i], hd[m]]; [hn[m], hn[i]] = [hn[i], hn[m]]; i = m; } }
+    return [d, v];
+  };
+  dist[src] = 0; push(0, src);
+  while (hd.length) {
     const [d, u] = pop(); if (d > dist[u]) continue; if (u === dst) break;
-    for (const [ei, v] of adj[u]) { const nd = d + edges[ei].len; if (nd < dist[v]) { dist[v] = nd; prev[v] = u; prevE[v] = ei; push([nd, v]); } }
+    const A = adj[u];
+    for (let k = 0; k < A.length; k += 2) { const ei = A[k], v = A[k + 1], nd = d + edges[ei].len; if (nd < dist[v]) { dist[v] = nd; prev[v] = u; prevE[v] = ei; push(nd, v); } }
   }
-  if (!isFinite(dist[dst])) return null;
-  const seq = []; for (let v = dst; v !== src; v = prev[v]) seq.push([prevE[v], prev[v]]);
-  return { steps: seq.reverse(), len: dist[dst] };
+  let res = null;
+  if (isFinite(dist[dst])) { const seq = []; for (let v = dst; v !== src; v = prev[v]) seq.push([prevE[v], prev[v]]); res = { steps: seq.reverse(), len: dist[dst] }; }
+  pairCache.set(key, res);
+  return res;
 }
 
 const routeCache = new Map();
@@ -285,14 +295,14 @@ function pointAt(r, s, out) {
 }
 function locate(r, x, y, hint) { // nearest arc-length on route; prefers the window around hint
   const scan = (lo, hi) => {
-    let best = { d: Infinity, s: 0 };
+    let bd = Infinity, bs = 0;
     for (let i = lo; i < hi; i++) {
       const ax = r.xs[i], ay = r.ys[i], dx = r.xs[i + 1] - ax, dy = r.ys[i + 1] - ay, L2 = dx * dx + dy * dy;
       const t = L2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / L2)) : 0;
       const d = Math.hypot(ax + dx * t - x, ay + dy * t - y);
-      if (d < best.d) best = { d, s: r.cum[i] + Math.sqrt(L2) * t };
+      if (d < bd) { bd = d; bs = r.cum[i] + Math.sqrt(L2) * t; }
     }
-    return best;
+    return { d: bd, s: bs };
   };
   const n = r.xs.length - 1;
   if (hint != null) {
@@ -316,7 +326,7 @@ function consistFor(name) {
 
 // ---------- train state ----------
 const trains = new Map(); // trainID -> state
-let lastFetchOk = 0, stationsFetched = false;
+let lastFetchOk = 0, stationsFetched = false, firstPollDone = false;
 
 const LATE_MIN = 15, VERY_LATE_MIN = 60;
 const tier = (late) => late >= VERY_LATE_MIN ? 'vlate' : late >= LATE_MIN ? 'late' : 'ok';
@@ -365,22 +375,21 @@ function ingest(data, fetchedAt) {
     const v = Math.max(0, (+t.velocity || 0) * MPH);
     if (!st || st.route !== route) {
       const now = Date.now(), s0 = Math.min(route.total, loc.s + v * Math.min(180, (now - ts) / 1000));
-      st = { id, route, sDisp: s0, vDisp: v, born: performance.now(), alpha: 0, pinged: new Set() };
+      st = { id, route, sDisp: s0, vDisp: v, alpha: firstPollDone ? 0 : 1, pinged: new Set() };
       route.stopS.forEach((ss, k) => { if (ss <= s0 + 0.1) st.pinged.add(k); }); // no pings for stops already behind it
       trains.set(id, st);
     }
     // The model won't carry a train past the next stop it hasn't reached yet; it eases in and waits
     const nextIdx = knownStops.findIndex(s => s.status === 'Enroute');
     st.capS = nextIdx >= 0 ? route.stopS[nextIdx] : route.total;
-    st.nextIdx = nextIdx;
-    Object.assign(st, { sMeas: loc.s, tMeas: ts, vMeas: v, info: t, late: lateness(t), consist: consistFor(t.routeName || ''), gone: false });
+    const late = lateness(t);
+    Object.assign(st, { sMeas: loc.s, tMeas: ts, vMeas: v, info: t, late, tier: tier(late), consist: consistFor(t.routeName || ''), gone: false });
     seen.add(id);
   }
   for (const st of trains.values()) if (!seen.has(st.id)) st.gone = true;
   if (missing.size) fetchMissingStations([...missing]);
 }
 
-const $ = (id) => document.getElementById(id);
 async function poll() {
   try {
     const res = await fetch(API + '/trains', { cache: 'no-store' });
@@ -396,11 +405,12 @@ async function poll() {
       ? 'Lost the train feed. Trains keep moving on their last known speed; retrying every 30 seconds.'
       : 'Can’t reach the Amtraker feed (api.amtraker.com). Check your connection or any blocker, and open this file in a regular browser tab. Retrying every 30 seconds.';
   }
+  firstPollDone = true; loading.step();
   updateCount();
   setTimeout(poll, POLL_MS);
 }
 function updateCount() {
-  const n = [...trains.values()].filter(t => !t.gone).length;
+  let n = 0; for (const t of trains.values()) if (!t.gone) n++;
   if (!lastFetchOk) { $('count').textContent = 'Waiting for train feed'; return; }
   const ago = Math.round((Date.now() - lastFetchOk) / 1000);
   $('count').textContent = `${n} trains · updated ${ago < 5 ? 'just now' : ago + ' s ago'}`;
@@ -410,6 +420,8 @@ setInterval(updateCount, 5000);
 // ---------- motion model ----------
 // Each train glides along its route at its reported speed. Corrections from new reports are
 // folded in as a gentle speed change rather than a jump, so motion stays continuous.
+const tmpA = [0, 0], tmpB = [0, 0];
+const pings = [];
 function stepTrains(dt) {
   const now = Date.now();
   for (const [id, t] of trains) {
@@ -433,23 +445,18 @@ function stepTrains(dt) {
     for (let k = 1; k < stopS.length; k++) {
       if (t.pinged.has(k) || t.sDisp < stopS[k] - 0.08) continue;
       t.pinged.add(k);
-      if (!t.gone) { pointAt(t.route, stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: rgbFor(t) }); }
+      if (!t.gone) { pointAt(t.route, stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[t.tier] }); }
     }
   }
 }
 function markPassed(t) { t.route.stopS.forEach((ss, k) => { if (ss <= t.sDisp + 0.08) t.pinged.add(k); }); }
-const pings = [];
 
 // ---------- view ----------
-const canvas = $('map'), ctx = canvas.getContext('2d');
-const base = document.createElement('canvas'), bctx = base.getContext('2d');
+const canvas = $('map'), ctx = canvas.getContext('2d', { alpha: false });
 let W = 0, H = 0, DPR = 1;
-// The base map is drawn larger than the screen by MARGIN px on each side, so panning and
-// following only re-render it when the view drifts past that margin or the zoom changes
-const MARGIN = 360, baseView = { x: 0, y: 0, s: 0 };
 const view = { x: 0, y: 0, s: 1 };          // world point at screen center, px per km
 const goal = { s: 1, ax: 0, ay: 0, sx: 0, sy: 0, active: false };
-let minS = 0.1, maxS = 1600, baseDirty = true, follow = null;
+let minS = 0.1, maxS = 1600, follow = null, lastViewChange = 0;
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 function fit() {
@@ -462,9 +469,8 @@ function resize() {
   const first = !W;
   W = innerWidth; H = innerHeight;
   canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
-  base.width = Math.round((W + 2 * MARGIN) * DPR); base.height = Math.round((H + 2 * MARGIN) * DPR);
   if (first) fit();
-  baseDirty = true;
+  base.force = true; lastViewChange = performance.now();
 }
 const toScreen = (x, y) => [(x - view.x) * view.s + W / 2, (y - view.y) * view.s + H / 2];
 const toWorld = (sx, sy) => [(sx - W / 2) / view.s + view.x, (sy - H / 2) / view.s + view.y];
@@ -482,7 +488,78 @@ function applyZoom(k) {
   view.s = Math.exp(nl);
   if (Math.abs(lg - nl) < 0.002) { view.s = goal.s; goal.active = false; }
   view.x = goal.ax - (goal.sx - W / 2) / view.s; view.y = goal.ay - (goal.sy - H / 2) / view.s;
-  baseDirty = true;
+}
+
+// ---------- base map (painted by the renderer, composited here) ----------
+const base = {
+  worker: null, cur: null, prev: null, sent: null, seq: 0, force: true, interactiveSent: false,
+};
+function startRenderer() {
+  const tileSrc = '(' + tileWorker.toString() + ')()';
+  const tileURL = URL.createObjectURL(new Blob([tileSrc], { type: 'text/javascript' }));
+  const init = {
+    type: 'init', geo: GEO, tileURL, tileSrc, MARGIN, DEM_URL, VEC_TILEJSON,
+    COL: { ground: COL.ground, land: COL.land, coast: COL.coast, border: COL.border, roadMajor: COL.roadMajor, roadMinor: COL.roadMinor, track: COL.track, water: COL.water, contour: COL.contour, building: COL.building, green: COL.green, station: COL.station },
+    dots: stationDots.flatMap(d => [d.x, d.y]),
+  };
+  const onMsg = (ev) => {
+    const m = ev.data;
+    if (m.type === 'frame') {
+      if (base.prev && base.prev.bmp.close) base.prev.bmp.close();
+      base.prev = base.cur; base.cur = m;
+      if (m.settled && !m.preloading) loading.mapReady = true;
+      loading.step();
+    } else if (m.type === 'progress') { loading.tiles = m; loading.step(); }
+  };
+  // Prefer a worker that can draw off the page; fall back to drawing on the page
+  const canWorkerDraw = typeof OffscreenCanvas !== 'undefined' && 'transferToImageBitmap' in OffscreenCanvas.prototype && typeof Worker !== 'undefined';
+  if (canWorkerDraw) {
+    try {
+      const src = '(' + rendererMain.toString() + ')()';
+      base.worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+      base.worker.onmessage = onMsg;
+    } catch (_) { base.worker = null; }
+  }
+  if (!base.worker) {
+    const fake = { postMessage: (m) => setTimeout(() => onMsg({ data: m }), 0) };
+    new Function('self', '(' + rendererMain.toString() + ')()')(fake);
+    base.worker = { postMessage: (m) => fake.onmessage({ data: m }) };
+  }
+  base.worker.postMessage(init);
+}
+// Ask for a fresh paint only when the image on hand no longer fits: the zoom moved, the view
+// drifted toward the image's edge, or interaction just settled (for a full-resolution pass)
+function requestBase(now) {
+  const interactive = goal.active || !!drag || !!pinch || now - lastViewChange < 160;
+  // During an animated zoom, paint where the zoom is headed: the result is ready on arrival, and
+  // when zooming out it already covers the screen while the animation plays
+  const tv = goal.active && !follow ? { s: goal.s, x: goal.ax - (goal.sx - W / 2) / goal.s, y: goal.ay - (goal.sy - H / 2) / goal.s } : view;
+  const r = base.sent;
+  let need = base.force || !r;
+  if (r) {
+    if (Math.abs(Math.log(tv.s / r.s)) > 0.002) need = true;
+    else if (Math.abs((tv.x - r.x) * tv.s) > MARGIN * 0.45 || Math.abs((tv.y - r.y) * tv.s) > MARGIN * 0.45) need = true;
+    else if (!interactive && base.interactiveSent) need = true;
+  }
+  const dpr = interactive ? 1 : DPR;
+  const msg = { type: 'view', x: tv.x, y: tv.y, s: tv.s, W, H, dpr, interactive, render: need, seq: ++base.seq };
+  if (need) { base.sent = msg; base.interactiveSent = interactive; base.force = false; }
+  base.worker.postMessage(msg);
+}
+function baseRect(f) {
+  const k = view.s / f.s;
+  return [(f.x - view.x) * view.s + W / 2 - (f.BW / 2) * k, (f.y - view.y) * view.s + H / 2 - (f.BH / 2) * k, f.BW * k, f.BH * k];
+}
+// Usually the newest image covers the whole screen and is the only thing drawn; while it is still
+// catching up with a fast zoom or pan, the previous image and the ground color fill the edges
+function drawBase() {
+  const c = base.cur;
+  const r = c && baseRect(c), covers = r && r[0] <= 0.5 && r[1] <= 0.5 && r[0] + r[2] >= W - 0.5 && r[1] + r[3] >= H - 0.5;
+  if (!covers) {
+    ctx.fillStyle = COL.ground; ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (base.prev) { const q = baseRect(base.prev); ctx.drawImage(base.prev.bmp, q[0] * DPR, q[1] * DPR, q[2] * DPR, q[3] * DPR); }
+  }
+  if (c) ctx.drawImage(c.bmp, r[0] * DPR, r[1] * DPR, r[2] * DPR, r[3] * DPR);
 }
 
 // ---------- input ----------
@@ -505,7 +582,7 @@ canvas.addEventListener('pointermove', (e) => {
     const cx = (a[0] + b[0]) / 2, cy = (a[1] + b[1]) / 2, [wx, wy] = toWorld(cx, cy);
     view.s = Math.max(minS, Math.min(maxS, pinch.s * d / pinch.d));
     view.x = wx - (cx - W / 2) / view.s; view.y = wy - (cy - H / 2) / view.s;
-    goal.active = false; baseDirty = true; moved = true; return;
+    goal.active = false; moved = true; return;
   }
   if (drag) {
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
@@ -513,7 +590,7 @@ canvas.addEventListener('pointermove', (e) => {
     if (moved) { view.x = drag.vx - dx / view.s; view.y = drag.vy - dy / view.s; goal.active = false; }
     return;
   }
-  mouseIn = true; hover(e.clientX, e.clientY);
+  mouseIn = true; mouse[0] = e.clientX; mouse[1] = e.clientY; hoverDirty = true;
 });
 const endPointer = (e) => {
   pointers.delete(e.pointerId); canvas.classList.remove('dragging');
@@ -541,14 +618,16 @@ addEventListener('keydown', (e) => {
 });
 addEventListener('resize', resize);
 
-let hovered = null, hoveredStation = null, mouse = [0, 0], mouseIn = false, tipAt = 0;
+// ---------- hover, tooltips, info panel ----------
+let hovered = null, hoveredStation = null, mouseIn = false, hoverDirty = false, lastHover = 0, tipAt = 0;
+const mouse = [0, 0];
 // Screen-space hit shapes from the last frame: each train is a polyline through its cars,
 // matched within a generous radius so long trains are hoverable anywhere along their length
 const hits = new Map();
-function distToPolyline(pts, x, y) {
+function distToPolyline(pts, n, x, y) {
+  if (n === 2) return Math.hypot(pts[0] - x, pts[1] - y);
   let d = Infinity;
-  if (pts.length === 2) return Math.hypot(pts[0] - x, pts[1] - y);
-  for (let i = 0; i < pts.length - 2; i += 2) {
+  for (let i = 0; i < n - 2; i += 2) {
     const ax = pts[i], ay = pts[i + 1], dx = pts[i + 2] - ax, dy = pts[i + 3] - ay, L2 = dx * dx + dy * dy;
     const t = L2 ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / L2)) : 0;
     d = Math.min(d, Math.hypot(ax + dx * t - x, ay + dy * t - y));
@@ -557,38 +636,40 @@ function distToPolyline(pts, x, y) {
 }
 function pick(sx, sy) {
   let best = null, bd = Infinity;
-  for (const [id, h] of hits) {
-    const d = distToPolyline(h.pts, sx, sy) - h.w / 2;
-    if (d < h.reach && d < bd) { bd = d; best = trains.get(id); }
+  for (const [t, h] of hits) {
+    if (sx < h.x0 - 20 || sx > h.x1 + 20 || sy < h.y0 - 20 || sy > h.y1 + 20) continue;
+    const d = distToPolyline(h.pts, h.n, sx, sy) - h.w / 2;
+    if (d < 14 && d < bd) { bd = d; best = t; }
   }
   return best;
 }
 function pickStation(sx, sy) {
-  let best = null, bd = 11;
-  for (const st of stationDots) { const p = toScreen(st.x, st.y), d = Math.hypot(p[0] - sx, p[1] - sy); if (d < bd) { bd = d; best = st; } }
+  const [wx, wy] = toWorld(sx, sy), r = 11 / view.s;
+  let best = null, bd = r;
+  for (const st of stationDots) { const d = Math.hypot(st.x - wx, st.y - wy); if (d < bd) { bd = d; best = st; } }
   return best;
 }
-function hover(sx, sy) {
-  mouse = [sx, sy];
-  const t = mouseIn && !drag && !pinch ? pick(sx, sy) : null;
-  const st = t || !mouseIn || drag ? null : pickStation(sx, sy);
-  if (t !== hovered) { hovered = t; tipAt = 0; }
-  hoveredStation = st;
-  canvas.classList.toggle('over-train', !!t);
-  const now = performance.now();
-  if (now - tipAt > 400) { renderTip(); tipAt = now; } else placeTip();
-  renderStationTip();
+function hover(now) {
+  const t = mouseIn && !drag && !pinch ? pick(mouse[0], mouse[1]) : null;
+  const st = t || !mouseIn || drag ? null : pickStation(mouse[0], mouse[1]);
+  if (t !== hovered) { hovered = t; tipAt = 0; canvas.classList.toggle('over-train', !!t); }
+  if (st !== hoveredStation) { hoveredStation = st; renderStationTip(); }
+  else if (st) placeStationTip();
+  if (now - tipAt > 500) { renderTip(); tipAt = now; } else placeTip();
 }
 function setFollow(t) {
   follow = t ? t.id : null;
   $('info').hidden = !t;
   infoAt = 0;
 }
-
+const fmtCache = new Map();
 function fmtTime(iso, tz) {
   const t = parseTime(iso); if (!isFinite(t)) return '–';
-  try { return new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit', timeZone: tz || undefined, timeZoneName: 'short' }).format(t); }
-  catch (_) { return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+  try {
+    let f = fmtCache.get(tz || '');
+    if (!f) { f = new Intl.DateTimeFormat([], { hour: 'numeric', minute: '2-digit', timeZone: tz || undefined, timeZoneName: 'short' }); fmtCache.set(tz || '', f); }
+    return f.format(t);
+  } catch (_) { return new Date(t).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
 }
 function trainFacts(t) {
   const i = t.info, next = i.stations.find(s => s.status === 'Enroute'), at = i.stations.find(s => s.status === 'Station');
@@ -605,31 +686,32 @@ function trainFacts(t) {
   ];
   return { title, rows, row };
 }
+let tipW = 0, tipH = 0;
 function placeTip() {
   const tip = $('tip'); if (tip.hidden) return;
-  const r = tip.getBoundingClientRect();
   let x = mouse[0], y = mouse[1];
-  if (x + r.width + 30 > W) x -= r.width + 28; if (y + r.height + 30 > H) y -= r.height + 28;
-  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+  if (x + tipW + 30 > W) x -= tipW + 28; if (y + tipH + 30 > H) y -= tipH + 28;
+  tip.style.transform = `translate(${x + 14}px, ${y + 14}px)`;
 }
 function renderTip() {
   const tip = $('tip'), t = hovered;
   if (!t || t.id === follow) { tip.hidden = true; return; }
   const f = trainFacts(t);
-  tip.className = 'card ' + tier(t.late);
+  tip.className = 'card ' + t.tier;
   tip.replaceChildren(f.title, f.row('To', t.info.destName || t.info.destCode || '–'), ...f.rows);
   tip.hidden = false;
+  tipW = tip.offsetWidth; tipH = tip.offsetHeight; // measured once per content change, not per frame
   placeTip();
 }
-let shownStation = null;
+function placeStationTip() {
+  const st = hoveredStation, p = toScreen(st.x, st.y);
+  $('stip').style.transform = `translate(${p[0]}px, ${p[1]}px) translate(-50%, calc(-100% - 10px))`;
+}
 function renderStationTip() {
   const tip = $('stip'), st = hoveredStation;
-  if (!st) { tip.hidden = true; shownStation = null; return; }
-  if (st === shownStation && !follow && !goal.active) return;
-  shownStation = st;
-  const p = toScreen(st.x, st.y), code = document.createElement('span'); code.textContent = st.code;
-  tip.replaceChildren(st.name, code);
-  tip.style.left = p[0] + 'px'; tip.style.top = p[1] + 'px'; tip.hidden = false;
+  if (!st) { tip.hidden = true; return; }
+  const code = document.createElement('span'); code.textContent = st.code;
+  tip.replaceChildren(st.name, code); tip.hidden = false; placeStationTip();
 }
 let infoAt = 0;
 function renderInfo(now) {
@@ -641,18 +723,15 @@ function renderInfo(now) {
   $('infoRoute').textContent = `${i.origName || i.origCode || '–'} → ${i.destName || i.destCode || '–'}`;
   const pct = t.route.total ? Math.round(100 * t.sDisp / t.route.total) : 0;
   $('infoPct').textContent = `${pct}% of trip`;
-  $('infoBar').style.width = pct + '%';
-  $('infoBar').style.background = `rgb(${rgbFor(t)})`;
-  $('infoRows').className = 'rows ' + tier(t.late);
+  $('infoBar').style.transform = `scaleX(${pct / 100})`;
+  $('infoBar').style.background = `rgb(${RGB[t.tier]})`;
+  $('infoRows').className = 'rows ' + t.tier;
   $('infoRows').replaceChildren(...f.rows);
+  // Fetch detail ahead of the train so following never outruns the map
+  const pts = [], r = t.route, reach = (Math.max(W, H) * 1.5) / view.s;
+  for (let k = 1; k <= 6; k++) { pointAt(r, t.sDisp + reach * k / 6, tmpA); pts.push(tmpA[0], tmpA[1]); }
+  base.worker.postMessage({ type: 'prefetch', pts });
 }
-
-// ---------- terrain and street detail (loaded as tiles while you zoom) ----------
-// Elevation: AWS Terrain Tiles (Terrarium PNG). Streets, water, buildings: OpenFreeMap vector tiles
-// (OpenMapTiles schema). Tiles are decoded, contoured and reprojected to the map's Albers km grid
-// in a worker so following a train never stutters.
-const DEM_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
-const VEC_TILEJSON = 'https://tiles.openfreemap.org/planet';
 
 function tileWorker() {
   const R = 6371, rad = Math.PI / 180;
@@ -669,12 +748,13 @@ function tileWorker() {
     return out;
   }
 
+  const td = new TextDecoder();
   // ---- minimal protobuf / Mapbox Vector Tile reader ----
   function decodeMVT(buf) {
     let pos = 0;
     const varint = () => { let v = 0, s = 1, b; do { b = buf[pos++]; v += (b & 0x7f) * s; s *= 128; } while (b & 0x80); return v; };
     const skip = (w) => { if (w === 0) varint(); else if (w === 1) pos += 8; else if (w === 2) pos += varint(); else if (w === 5) pos += 4; };
-    const str = (end) => new TextDecoder().decode(buf.subarray(pos, end));
+    const str = (end) => td.decode(buf.subarray(pos, end));
     const packed = () => { const len = varint(), end = pos + len, a = []; while (pos < end) a.push(varint()); return a; };
     const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
     const layers = [];
@@ -776,7 +856,7 @@ function tileWorker() {
         e = t;
       }
     };
-    if (z >= 11) blur(z >= 13 ? 3 : 2);
+    blur(z >= 13 ? 3 : z >= 11 ? 2 : 1); // smooths the data's 1 m height steps, which otherwise shade as stripes on flat ground
 
     // Hillshade (light from the northwest), as translucent dark/light pixels
     const latC = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 0.5) / 2 ** z)));
@@ -839,228 +919,253 @@ function tileWorker() {
   };
 }
 
-const tiles = (() => {
-  let worker = null;
-  try { worker = new Worker(URL.createObjectURL(new Blob(['(' + tileWorker.toString() + ')()'], { type: 'text/javascript' }))); }
-  catch (_) { /* no detail layers without workers */ }
-  const cache = new Map(), queue = [];
-  let inflight = 0, vecTemplate = null, vecMax = 14, stamp = 0;
 
-  if (worker) fetch(VEC_TILEJSON).then(r => r.ok ? r.json() : null).then(j => {
-    if (j && j.tiles && j.tiles[0]) { vecTemplate = j.tiles[0]; vecMax = Math.min(14, j.maxzoom || 14); baseDirty = true; }
-  }).catch(() => {});
-
-  function toPaths(m) {
-    if (m.kind === 'dem') {
-      const cv = document.createElement('canvas'); cv.width = cv.height = 256;
-      cv.getContext('2d').putImageData(new ImageData(m.img, 256, 256), 0, 0);
-      const seg = (a) => { const p = new Path2D(); for (let i = 0; i < a.length; i += 4) { p.moveTo(a[i], a[i + 1]); p.lineTo(a[i + 2], a[i + 3]); } return p; };
-      return { img: cv, grid: m.grid, minor: m.minor.length ? seg(m.minor) : null, major: m.major.length ? seg(m.major) : null };
-    }
-    const g = {};
-    for (const [k, G] of Object.entries(m.groups)) {
-      const p = new Path2D(), c = G.coords, st = G.starts;
-      for (let s = 0; s < st.length; s++) {
-        const a = st[s], b = s + 1 < st.length ? st[s + 1] : c.length;
-        p.moveTo(c[a], c[a + 1]); for (let i = a + 2; i < b; i += 2) p.lineTo(c[i], c[i + 1]);
-        if (G.closed) p.closePath();
-      }
-      g[k] = p;
-    }
-    return { groups: g };
+// ---------- base map renderer ----------
+// Runs in its own worker (or on the page when workers can't draw). It owns every static layer and
+// all tiles, and paints the base map for a requested view into an image. The page only stretches
+// and slides the latest image while you drag or zoom, so the map never blocks interaction.
+function rendererMain() {
+  const R = 6371, rad = Math.PI / 180;
+  const P1 = 29.5 * rad, P2 = 45.5 * rad, L0 = -96 * rad, F0 = 37.5 * rad;
+  const N = (Math.sin(P1) + Math.sin(P2)) / 2, C = Math.cos(P1) ** 2 + 2 * N * Math.sin(P1);
+  const RHO0 = Math.sqrt(C - 2 * N * Math.sin(F0)) / N;
+  function proj(lon, lat) {
+    const t = N * (lon * rad - L0), r = Math.sqrt(C - 2 * N * Math.sin(lat * rad)) / N;
+    return [R * r * Math.sin(t), -R * (RHO0 - r * Math.cos(t))];
   }
-  if (worker) worker.onmessage = (ev) => {
-    const m = ev.data, ent = cache.get(m.key); inflight--;
-    if (ent) {
-      if (m.error) ent.state = 'error';
-      else { m.kind = ent.kind; Object.assign(ent, toPaths(m)); ent.state = 'ready'; baseDirty = true; }
+  function unproj(x, y) {
+    const X = x / R, Y = -y / R, rho = Math.sign(N) * Math.hypot(X, RHO0 - Y), th = Math.atan2(X, RHO0 - Y);
+    return [(L0 + th / N) / rad, Math.asin(Math.max(-1, Math.min(1, (C - rho * rho * N * N) / (2 * N)))) / rad];
+  }
+  const ramp = (v, a, b) => Math.max(0, Math.min(1, (v - a) / (b - a)));
+  const mk = (w, h) => typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : Object.assign(globalThis.document.createElement('canvas'), { width: w, height: h });
+
+  let COL, MARGIN, DEM_URL, VEC_TILEJSON, L = null, dots = [];
+  let canvas = null, ctx = null, view = null;
+
+  // ---- static layers ----
+  function dec(arr, Q) {
+    const out = new Float32Array(arr.length); let x = 0, y = 0;
+    for (let i = 0; i < arr.length; i += 2) { x += arr[i]; y += arr[i + 1]; out[i] = x * Q; out[i + 1] = y * Q; }
+    return out;
+  }
+  function polyPath(rings, close) {
+    const p = new Path2D();
+    for (const a of rings) { p.moveTo(a[0], a[1]); for (let i = 2; i < a.length; i += 2) p.lineTo(a[i], a[i + 1]); if (close) p.closePath(); }
+    return p;
+  }
+  // Line layers: one whole-country path for far zooms, plus small bounded chunks so close zooms
+  // only stroke what is in view
+  function lineLayer(polylines) {
+    const CH = 40, chunks = [];
+    for (const a of polylines) for (let st = 0; st < a.length - 2; st += CH * 2) {
+      const end = Math.min(a.length, st + CH * 2 + 2), p = new Path2D();
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (let i = st; i < end; i += 2) {
+        const x = a[i], y = a[i + 1]; i === st ? p.moveTo(x, y) : p.lineTo(x, y);
+        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      }
+      chunks.push({ p, a: a.subarray(st, end), x0, y0, x1, y1 });
+    }
+    return { all: polyPath(polylines, false), chunks };
+  }
+  function init(m) {
+    ({ COL, MARGIN, DEM_URL, VEC_TILEJSON } = m);
+    const g = m.geo, Q = g.q, D = (k) => g[k].map(a => dec(a, Q));
+    L = {
+      land: polyPath(D('land'), true), lakes: polyPath(D('lakes'), true),
+      coast: lineLayer(D('coast')), borders: lineLayer(D('borders')),
+      roadsMajor: lineLayer(D('roadsMajor')), roadsMinor: lineLayer(D('roadsMinor')),
+      riversMajor: lineLayer(D('riversMajor')), riversMinor: lineLayer(D('riversMinor')),
+      track: lineLayer(g.edges.map(e => dec(e[2], Q))),
+    };
+    dots = m.dots;
+    // Tile decoders: two workers, or inline when nested workers aren't available
+    try { for (let i = 0; i < 2; i++) { const w = new Worker(m.tileURL); w.onmessage = onDecoded; decoders.push(w); } }
+    catch (_) {
+      const fake = { postMessage: (msg) => onDecoded({ data: msg }) };
+      new Function('self', m.tileSrc)(fake);
+      decoders.push({ postMessage: (msg) => fake.onmessage({ data: msg }) });
+    }
+    fetch(VEC_TILEJSON).then(r => r.ok ? r.json() : null).then(j => {
+      if (j && j.tiles && j.tiles[0]) { vecTemplate = j.tiles[0]; vecMax = Math.min(14, j.maxzoom || 14); requestRender(50); }
+    }).catch(() => {});
+    preload();
+  }
+
+  // ---- tiles ----
+  const decoders = [], cache = new Map(), queue = [], lastZ = {};
+  let rr = 0, inflight = 0, stamp = 0, vecTemplate = null, vecMax = 14;
+  const LIMIT = { dem: 320, vec: 700 };
+  const keyOf = (kind, z, x, y) => kind + z + '/' + x + '/' + y;
+  function get(kind, z, x, y, prio, pin) {
+    const key = keyOf(kind, z, x, y);
+    let e = cache.get(key);
+    if (!e) {
+      e = { kind, z, x, y, key, state: 'queued', used: stamp, pin: !!pin };
+      cache.set(key, e); queue.push({ e, prio });
+    } else if (e.state === 'queued') { const q = queue.find(q => q.e === e); if (q) q.prio = Math.min(q.prio, prio); }
+    e.used = stamp; if (pin) e.pin = true;
+    return e;
+  }
+  function pump() {
+    if (!queue.length || inflight >= 8) return;
+    queue.sort((a, b) => a.prio - b.prio);
+    while (inflight < 8 && queue.length) {
+      const { e } = queue.shift();
+      if (e.state !== 'queued') continue;
+      if (!e.pin && stamp - e.used > 30) { cache.delete(e.key); continue; } // left the view long ago
+      const url = (e.kind === 'dem' ? DEM_URL : vecTemplate).replace('{z}', e.z).replace('{x}', e.x).replace('{y}', e.y);
+      e.state = 'loading'; inflight++;
+      decoders[rr++ % decoders.length].postMessage({ key: e.key, kind: e.kind, url, z: e.z, x: e.x, y: e.y });
+    }
+  }
+  function onDecoded(ev) {
+    const m = ev.data, e = cache.get(m.key); inflight--;
+    if (e) {
+      if (m.error) e.state = 'error';
+      else if (e.kind === 'dem') {
+        const cv = mk(256, 256); cv.getContext('2d').putImageData(new ImageData(m.img, 256, 256), 0, 0);
+        const seg = (a) => { if (!a.length) return null; const p = new Path2D(); for (let i = 0; i < a.length; i += 4) { p.moveTo(a[i], a[i + 1]); p.lineTo(a[i + 2], a[i + 3]); } return p; };
+        Object.assign(e, { img: cv, grid: m.grid, minor: seg(m.minor), major: seg(m.major), state: 'ready' });
+      } else {
+        const g = {};
+        for (const [k, G] of Object.entries(m.groups)) {
+          const p = new Path2D(), c = G.coords, st = G.starts;
+          for (let s = 0; s < st.length; s++) {
+            const a = st[s], b = s + 1 < st.length ? st[s + 1] : c.length;
+            p.moveTo(c[a], c[a + 1]); for (let i = a + 2; i < b; i += 2) p.lineTo(c[i], c[i + 1]);
+            if (G.closed) p.closePath();
+          }
+          g[k] = p;
+        }
+        Object.assign(e, { groups: g, state: 'ready' });
+      }
+      if (preloading && e.pin) checkPreload();
+      if (e.state === 'ready' && e.used >= stamp - 1) requestRender(90);
     }
     pump();
-  };
-  function pump() {
-    while (inflight < 6 && queue.length) {
-      queue.sort((a, b) => a.prio - b.prio);
-      const q = queue.shift(), ent = cache.get(q.key);
-      if (!ent || ent.state !== 'queued') continue;
-      if (stamp - ent.used > 2) { cache.delete(q.key); continue; } // no longer on screen
-      ent.state = 'loading'; inflight++;
-      worker.postMessage({ key: q.key, kind: q.kind, url: q.url, z: q.z, x: q.x, y: q.y });
-    }
-  }
-  function get(kind, z, x, y, prio) {
-    const key = kind + z + '/' + x + '/' + y;
-    let ent = cache.get(key);
-    if (!ent) {
-      const url = (kind === 'dem' ? DEM_URL : vecTemplate).replace('{z}', z).replace('{x}', x).replace('{y}', y);
-      ent = { kind, state: 'queued', used: stamp }; cache.set(key, ent);
-      queue.push({ key, kind, url, z, x, y, prio });
-    }
-    ent.used = stamp;
-    return ent;
   }
   function evict() {
-    if (cache.size < 260) return;
-    const old = [...cache.entries()].filter(([, e]) => e.state === 'ready' || e.state === 'error').sort((a, b) => a[1].used - b[1].used);
-    for (let i = 0; i < old.length && cache.size > 200; i++) cache.delete(old[i][0]);
+    for (const kind of ['dem', 'vec']) {
+      const all = [...cache.values()].filter(e => e.kind === kind);
+      if (all.length <= LIMIT[kind]) continue;
+      const old = all.filter(e => !e.pin && e.state !== 'loading' && e.state !== 'queued' && e.used < stamp - 2).sort((a, b) => a.used - b.used);
+      for (let i = 0; i < old.length && all.length - i > LIMIT[kind] * 0.85; i++) cache.delete(old[i].key);
+    }
   }
   const lonLatTile = (lon, lat, z) => {
     const n = 2 ** z, la = Math.max(-85, Math.min(85, lat)) * rad;
     return [Math.floor((lon + 180) / 360 * n), Math.floor((1 - Math.log(Math.tan(la) + 1 / Math.cos(la)) / Math.PI) / 2 * n)];
   };
-  // Tiles covering the given world rectangle at zoom z, nearest the center first. Falls back to a
-  // loaded ancestor for tiles still on their way, so detail never blinks out while zooming.
-  function cover(kind, z, x0, y0, x1, y1, minZ) {
+  const tileLL = (z, x, y) => [x / 2 ** z * 360 - 180, Math.atan(Math.sinh(Math.PI * (1 - 2 * y / 2 ** z))) / rad];
+  function quadInto(p, z, x, y) { // tile outline in world km, edges subdivided so it follows the projection's curve
+    const S = 6; let first = true;
+    for (const [ax, ay, bx, by] of [[0, 0, 1, 0], [1, 0, 1, 1], [1, 1, 0, 1], [0, 1, 0, 0]]) for (let k = 0; k < S; k++) {
+      const f = k / S, [lon, lat] = tileLL(z, x + ax + (bx - ax) * f, y + ay + (by - ay) * f), [px, py] = proj(lon, lat);
+      first ? p.moveTo(px, py) : p.lineTo(px, py); first = false;
+    }
+    p.closePath();
+  }
+  function lonLatBox(x0, y0, x1, y1) {
     let lo0 = 180, lo1 = -180, la0 = 90, la1 = -90;
     for (let k = 0; k <= 6; k++) for (const [x, y] of [[x0 + (x1 - x0) * k / 6, y0], [x0 + (x1 - x0) * k / 6, y1], [x0, y0 + (y1 - y0) * k / 6], [x1, y0 + (y1 - y0) * k / 6]]) {
-      const [lon, lat] = unproject(x, y); lo0 = Math.min(lo0, lon); lo1 = Math.max(lo1, lon); la0 = Math.min(la0, lat); la1 = Math.max(la1, lat);
+      const [lon, lat] = unproj(x, y); lo0 = Math.min(lo0, lon); lo1 = Math.max(lo1, lon); la0 = Math.min(la0, lat); la1 = Math.max(la1, lat);
     }
-    lo0 = Math.max(lo0, -127); lo1 = Math.min(lo1, -65); la0 = Math.max(la0, 23); la1 = Math.min(la1, 50);
-    if (lo0 > lo1 || la0 > la1) return { list: [], ready: 1 };
+    return [Math.max(lo0, -127), Math.max(la0, 23), Math.min(lo1, -65), Math.min(la1, 50)];
+  }
+  function readyDescendants(kind, z, x, y, depth) {
+    if (!depth) return null;
+    const out = [];
+    for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
+      const e = cache.get(keyOf(kind, z + 1, x * 2 + dx, y * 2 + dy));
+      if (e && e.state === 'ready') { e.used = stamp; out.push(e); continue; }
+      const deeper = readyDescendants(kind, z + 1, x * 2 + dx, y * 2 + dy, depth - 1);
+      if (!deeper) return null;
+      out.push(...deeper);
+    }
+    return out;
+  }
+  // Tiles to draw for a view. Each slot uses its own tile when loaded, else loaded children
+  // (after zooming out), else the nearest loaded ancestor clipped to the slot (after zooming in),
+  // so detail never blinks out while new tiles arrive. The zoom level has hysteresis so it doesn't
+  // flip back and forth at a boundary.
+  function cover(kind, zf, box, minZ, maxZ) {
+    let z = Math.floor(zf);
+    const last = lastZ[kind];
+    if (last != null && zf > last - 0.4 && zf < last + 1.4) z = last;
+    z = Math.max(minZ, Math.min(maxZ, z));
+    const [lo0, la0, lo1, la1] = box;
+    if (lo0 > lo1 || la0 > la1) return { exact: [], fills: [], ready: 1, z };
     let tx0, ty0, tx1, ty1;
     for (;;) {
       [tx0, ty1] = lonLatTile(lo0, la0, z); [tx1, ty0] = lonLatTile(lo1, la1, z);
-      if ((tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= 48 || z <= minZ) break;
+      if ((tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= 60 || z <= minZ) break;
       z--;
     }
-    const cx = (tx0 + tx1) / 2, cy = (ty0 + ty1) / 2, out = [], seen = new Set(); let ready = 0, total = 0;
+    lastZ[kind] = z;
+    const cx = (tx0 + tx1) / 2, cy = (ty0 + ty1) / 2, exact = [], fillMap = new Map(); let ready = 0, total = 0;
     for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
       total++;
       const e = get(kind, z, tx, ty, Math.hypot(tx - cx, ty - cy));
-      if (e.state === 'ready') { ready++; out.push(e); continue; }
-      for (let pz = z - 1, px = tx >> 1, py = ty >> 1; pz >= Math.max(minZ, z - 4); pz--, px >>= 1, py >>= 1) {
-        const pk = kind + pz + '/' + px + '/' + py, pe = cache.get(pk);
-        if (pe && pe.state === 'ready') { if (!seen.has(pk)) { seen.add(pk); pe.used = stamp; out.unshift(pe); } break; }
+      if (e.state === 'ready') { ready++; exact.push(e); continue; }
+      const kids = readyDescendants(kind, z, tx, ty, 2);
+      if (kids) { exact.push(...kids); ready++; continue; }
+      let anc = null;
+      for (let pz = z - 1, px = tx >> 1, py = ty >> 1; pz >= Math.max(0, z - 7); pz--, px >>= 1, py >>= 1) {
+        const pe = cache.get(keyOf(kind, pz, px, py));
+        if (pe && pe.state === 'ready') { anc = pe; break; }
+      }
+      if (anc) {
+        anc.used = stamp;
+        let f = fillMap.get(anc.key); if (!f) { f = { ent: anc, clip: new Path2D() }; fillMap.set(anc.key, f); }
+        quadInto(f.clip, z, tx, ty);
+      } else {
+        for (let dy = 0; dy < 2; dy++) for (let dx = 0; dx < 2; dx++) {
+          const ce = cache.get(keyOf(kind, z + 1, tx * 2 + dx, ty * 2 + dy));
+          if (ce && ce.state === 'ready') { ce.used = stamp; exact.push(ce); }
+        }
       }
     }
-    return { list: out, ready: total ? ready / total : 1, z };
+    return { exact, fills: [...fillMap.values()], ready: ready / total, z };
   }
-  return {
-    enabled: () => !!worker,
-    hasVector: () => !!vecTemplate,
-    vecMax: () => vecMax,
-    begin() { stamp++; },
-    end() { evict(); pump(); },
-    cover,
-  };
-})();
 
-// ---------- drawing ----------
-const COL = {
-  ground: '#15181b', land: '#1f2327', coast: 'rgba(120,140,150,0.30)', border: 'rgba(150,172,182,0.34)',
-  roadMajor: 'rgba(150,165,175,', roadMinor: 'rgba(140,155,165,', track: 'rgba(110,150,165,',
-  accent: [99, 197, 191], late: [227, 168, 107], vlate: [226, 114, 124], car: '#dfeef0', station: 'rgba(196,214,220,',
-  water: 'rgba(96,140,160,', contour: 'rgba(150,176,186,', building: 'rgba(160,182,192,0.075)', green: 'rgba(120,160,150,0.035)',
-};
-const rgbFor = (t) => ({ ok: COL.accent, late: COL.late, vlate: COL.vlate })[tier(t.late)];
-const ramp = (v, a, b) => Math.max(0, Math.min(1, (v - a) / (b - a)));
+  // Terrain for the whole country loads before the map is shown, so zoomed-out views never pop in
+  let preloading = true;
+  const preloadList = [];
+  function preload() {
+    const add = (z, pin, prio) => {
+      const [x0, y0] = lonLatTile(-125.5, 49.5, z), [x1, y1] = lonLatTile(-66.5, 24, z);
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) { const e = get('dem', z, x, y, prio, pin); if (prio < 0) preloadList.push(e); }
+    };
+    add(4, true, -20); add(5, true, -10);
+    add(6, true, 200);   // background: sharper relief for state-level views
+    pump(); checkPreload();
+  }
+  function checkPreload() {
+    const done = preloadList.filter(e => e.state === 'ready' || e.state === 'error').length;
+    self.postMessage({ type: 'progress', done, total: preloadList.length });
+    if (done === preloadList.length && preloading) { preloading = false; requestRender(0); }
+  }
 
-function drawBase() {
-  const c = bctx, s = view.s, BW = W + 2 * MARGIN, BH = H + 2 * MARGIN;
-  Object.assign(baseView, { x: view.x, y: view.y, s });
-  const bs = (x, y) => [(x - view.x) * s + BW / 2, (y - view.y) * s + BH / 2];
-  c.setTransform(1, 0, 0, 1, 0, 0);
-  c.fillStyle = COL.ground; c.fillRect(0, 0, base.width, base.height);
-  const world = () => c.setTransform(s * DPR, 0, 0, s * DPR, (BW / 2 - view.x * s) * DPR, (BH / 2 - view.y * s) * DPR);
-  world();
-  c.lineJoin = 'round'; c.lineCap = 'round';
-  const m = 4 / s, vx0 = view.x - BW / 2 / s, vx1 = view.x + BW / 2 / s, vy0 = view.y - BH / 2 / s, vy1 = view.y + BH / 2 / s;
-  const stroke = (L) => {
-    if (s < 2.5) { c.stroke(L.all); return; }
-    for (const ch of L.chunks) if (ch.x1 >= vx0 - m && ch.x0 <= vx1 + m && ch.y1 >= vy0 - m && ch.y0 <= vy1 + m) c.stroke(ch.p);
-  };
-  const px = 1 / s, clampW = (k, lo, hi) => Math.max(lo, Math.min(hi, k * s)) * px;
-  c.fillStyle = COL.land; c.fill(layers.land, 'evenodd');
-
-  // Everything that describes the ground stays inside the US outline
-  c.save(); c.clip(layers.land, 'evenodd');
-  tiles.begin();
-  const latC = unproject(view.x, view.y)[1], kmPerDeg = Math.cos(latC * rad);
-  let vec = null;
-  if (tiles.enabled()) {
-    // Terrain: hillshade at every zoom, contours once zoomed in
-    const zd = Math.max(3, Math.min(14, Math.floor(Math.log2(40075 * kmPerDeg * s / 256)) - 1));
-    const dem = tiles.cover('dem', zd, vx0, vy0, vx1, vy1, 3);
-    c.imageSmoothingEnabled = true;
-    c.globalAlpha = 1 - 0.6 * ramp(s, 25, 300);
-    for (const t of dem.list) drawWarped(c, t.img, t.grid);
-    c.globalAlpha = 1;
-    for (const t of dem.list) {
-      if (t.minor) { c.strokeStyle = COL.contour + '0.085)'; c.lineWidth = 0.8 * px; c.stroke(t.minor); }
-      if (t.major) { c.strokeStyle = COL.contour + '0.16)'; c.lineWidth = 1.1 * px; c.stroke(t.major); }
+  function prefetch(m) { // tiles ahead of a followed train, so following never outruns the detail
+    if (!view) return;
+    const kmPer = Math.cos(unproj(view.x, view.y)[1] * rad), s = view.s;
+    const zd = Math.max(3, Math.min(14, Math.floor(Math.log2(40075 * kmPer * s / 256)) - 1));
+    const zv = Math.min(vecMax, Math.floor(Math.log2(40075 * kmPer * s / 512) + 0.5));
+    for (let i = 0; i < m.pts.length; i += 2) {
+      const [lon, lat] = unproj(m.pts[i], m.pts[i + 1]);
+      const [dx, dy] = lonLatTile(lon, lat, zd); get('dem', zd, dx, dy, 50 + i);
+      if (vecTemplate && zv >= 9) { const [vx, vy] = lonLatTile(lon, lat, zv); get('vec', zv, vx, vy, 50 + i); }
     }
-    // Streets, water, buildings from vector tiles once zoomed past state level
-    const zv = Math.min(tiles.vecMax(), Math.round(Math.log2(40075 * kmPerDeg * s / 512)));
-    if (tiles.hasVector() && zv >= 9) vec = tiles.cover('vec', zv, vx0, vy0, vx1, vy1, 6);
+    pump();
   }
-  const vecFull = vec && vec.ready > 0.8;
-  const each = (g, fn) => { if (vec) for (const t of vec.list) if (t.groups && t.groups[g]) fn(t.groups[g]); };
 
-  each('green', p => { c.fillStyle = COL.green; c.fill(p); });
-  // Water: the same ground tone as the ocean, with a faint shoreline
-  if (!vecFull) { c.fillStyle = COL.ground; c.fill(layers.lakes); c.strokeStyle = COL.water + '0.28)'; c.lineWidth = px; c.stroke(layers.lakes); }
-  each('water', p => { c.fillStyle = COL.ground; c.fill(p); c.strokeStyle = COL.water + '0.3)'; c.lineWidth = px; c.stroke(p); });
-  if (!vecFull) {
-    const rmaj = ramp(s, 0.3, 0.8), rmin = ramp(s, 1.2, 2.6);
-    if (rmin > 0) { c.strokeStyle = COL.water + (0.22 * rmin) + ')'; c.lineWidth = px; stroke(layers.riversMinor); }
-    if (rmaj > 0) { c.strokeStyle = COL.water + (0.36 * rmaj) + ')'; c.lineWidth = px * (s > 4 ? 1.6 : 1.1); stroke(layers.riversMajor); }
-  }
-  each('stream', p => { c.strokeStyle = COL.water + '0.3)'; c.lineWidth = clampW(0.003, 0.7, 1.6); c.stroke(p); });
-  each('river', p => { c.strokeStyle = COL.water + '0.45)'; c.lineWidth = clampW(0.012, 1.1, 5); c.stroke(p); });
-
-  if (!vecFull) {
-    const minor = ramp(s, 2.2, 4.5), major = ramp(s, 0.7, 1.6);
-    if (minor > 0) { c.strokeStyle = COL.roadMinor + (0.16 * minor) + ')'; c.lineWidth = px; stroke(layers.roadsMinor); }
-    if (major > 0) { c.strokeStyle = COL.roadMajor + (0.22 * major) + ')'; c.lineWidth = px * (s > 4 ? 1.5 : 1); stroke(layers.roadsMajor); }
-  }
-  each('road4', p => { c.strokeStyle = COL.roadMinor + '0.11)'; c.lineWidth = clampW(0.004, 0.6, 2.2); c.stroke(p); });
-  each('road3', p => { c.strokeStyle = COL.roadMinor + '0.17)'; c.lineWidth = clampW(0.007, 0.8, 3.4); c.stroke(p); });
-  each('road2', p => { c.strokeStyle = COL.roadMajor + '0.23)'; c.lineWidth = clampW(0.01, 1, 4.6); c.stroke(p); });
-  each('road1', p => { c.strokeStyle = COL.roadMajor + '0.3)'; c.lineWidth = clampW(0.013, 1.3, 6); c.stroke(p); });
-  each('building', p => { c.fillStyle = COL.building; c.fill(p); });
-  each('rail', p => { c.strokeStyle = COL.track + '0.3)'; c.lineWidth = clampW(0.0025, 0.8, 2); c.stroke(p); });
-  tiles.end();
-  c.restore();
-
-  c.strokeStyle = COL.coast; c.lineWidth = px; stroke(layers.coast);
-  c.setLineDash([1.2 * px, 4 * px]); c.strokeStyle = COL.border; c.lineWidth = 1.2 * px;
-  if (s < 2.5) stroke(layers.borders);
-  else {
-    // Dashing is costly per dash, so clip each border segment to the view first. Clipped starts
-    // snap back to a whole dash period so the pattern doesn't crawl while panning.
-    const per = 5.2 * px, bp = new Path2D();
-    for (const ch of layers.borders.chunks) {
-      if (ch.x1 < vx0 - m || ch.x0 > vx1 + m || ch.y1 < vy0 - m || ch.y0 > vy1 + m) continue;
-      const a = ch.a;
-      for (let i = 0; i < a.length - 2; i += 2) {
-        const ax = a[i], ay = a[i + 1], bx = a[i + 2], by = a[i + 3];
-        const cl = clipSeg(ax, ay, bx, by, vx0 - m, vy0 - m, vx1 + m, vy1 + m); if (!cl) continue;
-        const len = Math.hypot(bx - ax, by - ay); if (!len) continue;
-        const t0 = Math.floor(cl[0] * len / per) * per / len;
-        bp.moveTo(ax + (bx - ax) * t0, ay + (by - ay) * t0); bp.lineTo(ax + (bx - ax) * cl[1], ay + (by - ay) * cl[1]);
-      }
-    }
-    c.stroke(bp);
-  }
-  c.setLineDash([]);
-
-  c.strokeStyle = COL.track + (0.38 + 0.2 * ramp(s, 1, 10)) + ')'; c.lineWidth = px * (s > 30 ? 2.2 : s > 3 ? 1.5 : 1.1); stroke(layers.track);
-
-  // Station dots, in screen space so they stay a constant size
-  c.setTransform(DPR, 0, 0, DPR, 0, 0);
-  const dr = s < 0.6 ? 1.3 : s < 6 ? 1.8 : 2.6, dots = new Path2D();
-  for (const st of stationDots) {
-    const p = bs(st.x, st.y); if (p[0] < -5 || p[1] < -5 || p[0] > BW + 5 || p[1] > BH + 5) continue;
-    dots.moveTo(p[0] + dr, p[1]); dots.arc(p[0], p[1], dr, 0, Math.PI * 2);
-  }
-  c.fillStyle = COL.station + (s < 0.6 ? 0.3 : 0.42) + ')'; c.fill(dots);
-  baseDirty = false;
-
-  // Draws a Mercator image tile into Albers space as 16 small affine pieces (seams overlap 1px)
-  function drawWarped(c, img, g) {
+  // ---- painting ----
+  function drawWarped(c, img, g) { // Mercator image tile into Albers space as 16 affine pieces
     const M = c.getTransform();
     for (let b = 0; b < 4; b++) for (let a = 0; a < 4; a++) {
-      const i00 = (b * 5 + a) * 2, i10 = i00 + 2, i01 = i00 + 10;
-      const sx = a * 64, sy = b * 64;
+      const i00 = (b * 5 + a) * 2, i10 = i00 + 2, i01 = i00 + 10, sx = a * 64, sy = b * 64;
       const ax = (g[i10] - g[i00]) / 64, ay = (g[i10 + 1] - g[i00 + 1]) / 64, cx = (g[i01] - g[i00]) / 64, cy = (g[i01 + 1] - g[i00 + 1]) / 64;
       const ex = g[i00] - ax * sx - cx * sy, ey = g[i00 + 1] - ay * sx - cy * sy;
       c.setTransform(M.a * ax + M.c * ay, M.b * ax + M.d * ay, M.a * cx + M.c * cy, M.b * cx + M.d * cy, M.a * ex + M.c * ey + M.e, M.b * ex + M.d * ey + M.f);
@@ -1068,14 +1173,151 @@ function drawBase() {
     }
     c.setTransform(M);
   }
+  function render(v) {
+    const { x: vx, y: vy, s, W, H, dpr } = v, BW = W + 2 * MARGIN, BH = H + 2 * MARGIN;
+    const cw = Math.round(BW * dpr), chh = Math.round(BH * dpr);
+    if (!canvas) { canvas = mk(cw, chh); ctx = canvas.getContext('2d', { alpha: false }); }
+    else if (canvas.width !== cw || canvas.height !== chh) { canvas.width = cw; canvas.height = chh; }
+    const c = ctx; stamp++;
+    c.setTransform(1, 0, 0, 1, 0, 0);
+    c.fillStyle = COL.ground; c.fillRect(0, 0, cw, chh);
+    c.setTransform(s * dpr, 0, 0, s * dpr, (BW / 2 - vx * s) * dpr, (BH / 2 - vy * s) * dpr);
+    c.lineJoin = 'round'; c.lineCap = 'round';
+    const x0 = vx - BW / 2 / s, x1 = vx + BW / 2 / s, y0 = vy - BH / 2 / s, y1 = vy + BH / 2 / s, m = 4 / s;
+    const inView = (ch) => ch.x1 >= x0 - m && ch.x0 <= x1 + m && ch.y1 >= y0 - m && ch.y0 <= y1 + m;
+    const stroke = (Ly) => { if (s < 2.5) c.stroke(Ly.all); else for (const ch of Ly.chunks) if (inView(ch)) c.stroke(ch.p); };
+    const px = 1 / s, clampW = (k, lo, hi) => Math.max(lo, Math.min(hi, k * s)) * px;
+    c.fillStyle = COL.land; c.fill(L.land, 'evenodd');
+
+    // Ground detail stays inside the US outline
+    c.save(); c.clip(L.land, 'evenodd');
+    const box = lonLatBox(x0, y0, x1, y1), kmPer = Math.cos(unproj(vx, vy)[1] * rad);
+    const each = (cov, fn) => {
+      for (const e of cov.exact) fn(e);
+      for (const f of cov.fills) { c.save(); c.clip(f.clip); fn(f.ent); c.restore(); }
+    };
+    // Terrain: hillshade everywhere, contours once zoomed in
+    const dem = cover('dem', Math.log2(40075 * kmPer * s / 256) - 1, box, 4, 14);
+    c.globalAlpha = 1 - 0.6 * ramp(s, 25, 300);
+    each(dem, e => drawWarped(c, e.img, e.grid));
+    c.globalAlpha = 1;
+    each(dem, e => {
+      if (e.minor) { c.strokeStyle = COL.contour + '0.085)'; c.lineWidth = 0.8 * px; c.stroke(e.minor); }
+      if (e.major) { c.strokeStyle = COL.contour + '0.16)'; c.lineWidth = 1.1 * px; c.stroke(e.major); }
+    });
+    // Streets, water and buildings from vector tiles past state level; the built-in roads and
+    // water fade out over the same zoom range rather than switching on load progress
+    const zvf = Math.log2(40075 * kmPer * s / 512) + 0.5;
+    const vec = vecTemplate && zvf >= 9 ? cover('vec', zvf, box, 9, vecMax) : null;
+    const ne = vecTemplate ? 1 - ramp(s, 11, 22) : 1;
+    const grp = (g, fn) => { if (vec) each(vec, e => { if (e.groups[g]) fn(e.groups[g]); }); };
+
+    grp('green', p => { c.fillStyle = COL.green; c.fill(p); });
+    if (ne > 0) {
+      c.globalAlpha = ne; c.fillStyle = COL.ground; c.fill(L.lakes);
+      c.strokeStyle = COL.water + '0.28)'; c.lineWidth = px; c.stroke(L.lakes); c.globalAlpha = 1;
+    }
+    grp('water', p => { c.fillStyle = COL.ground; c.fill(p); c.strokeStyle = COL.water + '0.3)'; c.lineWidth = px; c.stroke(p); });
+    if (ne > 0) {
+      const rmaj = ramp(s, 0.3, 0.8) * ne, rmin = ramp(s, 1.2, 2.6) * ne;
+      if (rmin > 0) { c.strokeStyle = COL.water + (0.22 * rmin).toFixed(3) + ')'; c.lineWidth = px; stroke(L.riversMinor); }
+      if (rmaj > 0) { c.strokeStyle = COL.water + (0.36 * rmaj).toFixed(3) + ')'; c.lineWidth = px * (s > 4 ? 1.6 : 1.1); stroke(L.riversMajor); }
+    }
+    grp('stream', p => { c.strokeStyle = COL.water + '0.3)'; c.lineWidth = clampW(0.003, 0.7, 1.6); c.stroke(p); });
+    grp('river', p => { c.strokeStyle = COL.water + '0.45)'; c.lineWidth = clampW(0.012, 1.1, 5); c.stroke(p); });
+    if (ne > 0) {
+      const minor = ramp(s, 2.2, 4.5) * ne, major = ramp(s, 0.7, 1.6) * ne;
+      if (minor > 0) { c.strokeStyle = COL.roadMinor + (0.16 * minor).toFixed(3) + ')'; c.lineWidth = px; stroke(L.roadsMinor); }
+      if (major > 0) { c.strokeStyle = COL.roadMajor + (0.22 * major).toFixed(3) + ')'; c.lineWidth = px * (s > 4 ? 1.5 : 1); stroke(L.roadsMajor); }
+    }
+    grp('road4', p => { c.strokeStyle = COL.roadMinor + '0.11)'; c.lineWidth = clampW(0.004, 0.6, 2.2); c.stroke(p); });
+    grp('road3', p => { c.strokeStyle = COL.roadMinor + '0.17)'; c.lineWidth = clampW(0.007, 0.8, 3.4); c.stroke(p); });
+    grp('road2', p => { c.strokeStyle = COL.roadMajor + '0.23)'; c.lineWidth = clampW(0.01, 1, 4.6); c.stroke(p); });
+    grp('road1', p => { c.strokeStyle = COL.roadMajor + '0.3)'; c.lineWidth = clampW(0.013, 1.3, 6); c.stroke(p); });
+    grp('building', p => { c.fillStyle = COL.building; c.fill(p); });
+    grp('rail', p => { c.strokeStyle = COL.track + '0.3)'; c.lineWidth = clampW(0.0025, 0.8, 2); c.stroke(p); });
+    c.restore();
+    evict(); pump();
+
+    c.strokeStyle = COL.coast; c.lineWidth = px; stroke(L.coast);
+    c.setLineDash([1.2 * px, 4 * px]); c.strokeStyle = COL.border; c.lineWidth = 1.2 * px;
+    if (s < 2.5) stroke(L.borders);
+    else {
+      // Dashing costs per dash, so clip each border segment to the view first. Clipped starts snap
+      // back to a whole dash period so the pattern doesn't crawl while panning.
+      const per = 5.2 * px, bp = new Path2D();
+      for (const ch of L.borders.chunks) {
+        if (!inView(ch)) continue;
+        const a = ch.a;
+        for (let i = 0; i < a.length - 2; i += 2) {
+          const ax = a[i], ay = a[i + 1], bx = a[i + 2], by = a[i + 3];
+          const cl = clipSeg(ax, ay, bx, by, x0 - m, y0 - m, x1 + m, y1 + m); if (!cl) continue;
+          const len = Math.hypot(bx - ax, by - ay); if (!len) continue;
+          const t0 = Math.floor(cl[0] * len / per) * per / len;
+          bp.moveTo(ax + (bx - ax) * t0, ay + (by - ay) * t0); bp.lineTo(ax + (bx - ax) * cl[1], ay + (by - ay) * cl[1]);
+        }
+      }
+      c.stroke(bp);
+    }
+    c.setLineDash([]);
+    c.strokeStyle = COL.track + (0.38 + 0.2 * ramp(s, 1, 10)).toFixed(3) + ')'; c.lineWidth = px * (s > 30 ? 2.2 : s > 3 ? 1.5 : 1.1); stroke(L.track);
+
+    // Station dots in image pixels so they keep a constant size
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const dr = s < 0.6 ? 1.3 : s < 6 ? 1.8 : 2.6, dp = new Path2D();
+    for (let i = 0; i < dots.length; i += 2) {
+      const qx = (dots[i] - vx) * s + BW / 2, qy = (dots[i + 1] - vy) * s + BH / 2;
+      if (qx < -5 || qy < -5 || qx > BW + 5 || qy > BH + 5) continue;
+      dp.moveTo(qx + dr, qy); dp.arc(qx, qy, dr, 0, Math.PI * 2);
+    }
+    c.fillStyle = COL.station + (s < 0.6 ? 0.3 : 0.42) + ')'; c.fill(dp);
+
+    let bmp;
+    if (canvas.transferToImageBitmap) bmp = canvas.transferToImageBitmap();
+    else { bmp = mk(cw, chh); bmp.getContext('2d').drawImage(canvas, 0, 0); }
+    const msg = { type: 'frame', bmp, x: vx, y: vy, s, BW, BH, dpr, seq: v.seq, settled: !v.interactive, preloading };
+    try { self.postMessage(msg, canvas.transferToImageBitmap ? [bmp] : []); } catch (_) { self.postMessage(msg); }
+  }
+  function clipSeg(ax, ay, bx, by, x0, y0, x1, y1) {
+    let t0 = 0, t1 = 1; const dx = bx - ax, dy = by - ay;
+    const P = [-dx, dx, -dy, dy], Qv = [ax - x0, x1 - ax, ay - y0, y1 - ay];
+    for (let i = 0; i < 4; i++) {
+      if (P[i] === 0) { if (Qv[i] < 0) return null; continue; }
+      const r = Qv[i] / P[i];
+      if (P[i] < 0) { if (r > t1) return null; if (r > t0) t0 = r; } else { if (r < t0) return null; if (r < t1) t1 = r; }
+    }
+    return [t0, t1];
+  }
+
+  // Renders are coalesced: only the newest view is ever painted
+  let queued = false;
+  function requestRender(delay) {
+    if (queued) return; queued = true;
+    setTimeout(() => { queued = false; if (view && L) render(view); }, delay);
+  }
+  self.onmessage = (ev) => {
+    const m = ev.data;
+    if (m.type === 'init') init(m);
+    else if (m.type === 'view') { view = m; if (m.render) requestRender(0); }
+    else if (m.type === 'prefetch') prefetch(m);
+  };
 }
 
-const tmpA = [0, 0], tmpB = [0, 0];
-const sprites = new Map();
-function glowSprite(rgb) {
+
+// ---------- trains ----------
+const COL = {
+  ground: '#15181b', land: '#1f2327', coast: 'rgba(120,140,150,0.30)', border: 'rgba(150,172,182,0.34)',
+  roadMajor: 'rgba(150,165,175,', roadMinor: 'rgba(140,155,165,', track: 'rgba(110,150,165,',
+  water: 'rgba(96,140,160,', contour: 'rgba(150,176,186,', building: 'rgba(160,182,192,0.075)', green: 'rgba(120,160,150,0.035)',
+  station: 'rgba(196,214,220,', car: '#dfeef0',
+};
+const RGB = { ok: '99,197,191', late: '227,168,107', vlate: '226,114,124' };
+const ramp = (v, a, b) => Math.max(0, Math.min(1, (v - a) / (b - a)));
+const sprites = {};
+function glowSprite(t) {
   // Built pixel by pixel with a little noise so the very faint falloff doesn't band into rings
-  const k = rgb.join(); if (sprites.has(k)) return sprites.get(k);
-  const S = 384, cv = document.createElement('canvas'); cv.width = cv.height = S;
+  if (sprites[t]) return sprites[t];
+  const rgb = RGB[t].split(',').map(Number), S = 256, cv = document.createElement('canvas'); cv.width = cv.height = S;
   const g = cv.getContext('2d'), img = g.createImageData(S, S), d = img.data;
   for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
     const f = Math.min(1, Math.hypot(x - S / 2 + 0.5, y - S / 2 + 0.5) / (S / 2));
@@ -1083,90 +1325,110 @@ function glowSprite(rgb) {
     const o = (y * S + x) * 4; d[o] = rgb[0]; d[o + 1] = rgb[1]; d[o + 2] = rgb[2]; d[o + 3] = Math.max(0, Math.round(al));
   }
   g.putImageData(img, 0, 0);
-  sprites.set(k, cv); return cv;
+  return (sprites[t] = cv);
 }
-function roundRect(c, x, y, w, h, r) {
-  r = Math.min(r, w / 2, h / 2);
-  c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
-  c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
-}
+for (const t of Object.keys(RGB)) glowSprite(t); // built up front
 
-function trainGeom(t) {
-  const s = view.s, far = 1 - ramp(s, 0.4, 3), near = ramp(s, 0.6, 25);
+function geom(s) {
+  const far = 1 - ramp(s, 0.4, 3), near = ramp(s, 0.6, 25);
   // Car geometry: true scale when zoomed in, a legible minimum when zoomed out
   const carPx = Math.max(0.0255 * s, 3 + 7 * near), gapPx = Math.max(0.0015 * s, 0.8 + 1.2 * near);
-  const wPx = Math.max(0.0031 * s, 2.6 + 2.6 * near), carKm = carPx / s, gapKm = gapPx / s;
-  return { s, far, near, wPx, carKm, gapKm, trainKm: t.consist.n * (carKm + gapKm) };
+  return { far, near, wPx: Math.max(0.0031 * s, 2.6 + 2.6 * near), carKm: carPx / s, gapKm: gapPx / s };
 }
-
-// Soft effects: the trail behind the train and its glow. Drawn clipped to the US outline.
-function drawTrainFx(c, t) {
-  const r = t.route, a = t.alpha, rgb = rgbFor(t), G = trainGeom(t), { s, far, near, wPx, trainKm } = G, head = t.sDisp;
-  const trailPx = 70 + 110 * far, trailKm = Math.min(trailPx / s, 400);
-  const tail0 = head - trainKm, steps = 22, trailA = (0.25 + 0.55 * far) * a;
+// Screen points along a route between two arc lengths
+const trailPts = new Float64Array(4096);
+function routeScreen(r, sa, sb) {
+  let n = 0;
+  const put = (x, y) => { if (n < trailPts.length - 2) { trailPts[n++] = (x - view.x) * view.s + W / 2; trailPts[n++] = (y - view.y) * view.s + H / 2; } };
+  pointAt(r, sa, tmpA); put(tmpA[0], tmpA[1]);
+  for (let i = seg(r, sa) + 1; i < r.xs.length && r.cum[i] < sb; i++) put(r.xs[i], r.ys[i]);
+  pointAt(r, sb, tmpA); put(tmpA[0], tmpA[1]);
+  return n;
+}
+function strokeRange(c, r, sa, sb, width, rgb, a0, a1) {
+  if (sb - sa <= 0) return;
+  const n = routeScreen(r, sa, sb); if (n < 4) return;
+  const g = c.createLinearGradient(trailPts[0], trailPts[1], trailPts[n - 2], trailPts[n - 1]);
+  g.addColorStop(0, `rgba(${rgb},${a0})`); g.addColorStop(1, `rgba(${rgb},${a1})`);
+  c.strokeStyle = g; c.lineWidth = width;
+  c.beginPath(); c.moveTo(trailPts[0], trailPts[1]); for (let i = 2; i < n; i += 2) c.lineTo(trailPts[i], trailPts[i + 1]); c.stroke();
+}
+// Soft effects: the trail behind each train and its glow. A few gradient strokes per train taper
+// the trail (thin and faint at the far end, brighter near the cars).
+function drawTrainFx(c, t, G) {
+  const r = t.route, a = t.alpha, rgb = RGB[t.tier], s = view.s, head = t.sDisp;
+  const trainKm = t.consist.n * (G.carKm + G.gapKm), tail0 = head - trainKm;
+  const trailKm = Math.min((70 + 110 * G.far) / s, 400), trailA = (0.25 + 0.55 * G.far) * a;
   if (tail0 > 0 && trailA > 0.02) {
-    c.lineCap = 'round';
-    for (let k = 0; k < steps; k++) {
-      const f0 = k / steps, f1 = (k + 1) / steps;
-      const s0 = tail0 - trailKm * (1 - f0), s1 = tail0 - trailKm * (1 - f1);
-      if (s1 <= 0) continue;
-      pointAt(r, Math.max(0, s0), tmpA); pointAt(r, s1, tmpB);
-      const p0 = toScreen(tmpA[0], tmpA[1]), p1 = toScreen(tmpB[0], tmpB[1]);
-      const e = f1 * f1;
-      c.strokeStyle = `rgba(${rgb},${(trailA * e * 0.1).toFixed(3)})`; c.lineWidth = wPx * 3.2 * (0.4 + 0.6 * f1);
-      c.beginPath(); c.moveTo(p0[0], p0[1]); c.lineTo(p1[0], p1[1]); c.stroke();
-      c.strokeStyle = `rgba(${rgb},${(trailA * e).toFixed(3)})`; c.lineWidth = Math.max(1, wPx * 0.55 * (0.3 + 0.7 * f1));
-      c.beginPath(); c.moveTo(p0[0], p0[1]); c.lineTo(p1[0], p1[1]); c.stroke();
-    }
+    const s0 = Math.max(0, tail0 - trailKm);
+    strokeRange(c, r, s0, tail0, G.wPx * 2.6, rgb, 0, (trailA * 0.08).toFixed(3));
+    strokeRange(c, r, s0, tail0, Math.max(1, G.wPx * 0.3), rgb, 0, (trailA * 0.55).toFixed(3));
+    strokeRange(c, r, Math.max(s0, tail0 - trailKm * 0.55), tail0, Math.max(1, G.wPx * 0.45), rgb, 0, (trailA * 0.5).toFixed(3));
   }
-  // Wide, faint glow: a pre-rendered falloff sprite, centered mid-train
   pointAt(r, Math.max(0, head - trainKm / 2), tmpB);
-  const gp = toScreen(tmpB[0], tmpB[1]), gr = Math.min(Math.max(70 + 40 * near, trainKm * s * 0.6), 260);
-  c.globalAlpha = (0.55 + 0.45 * far) * a * 0.42;
-  c.drawImage(glowSprite(rgb), gp[0] - gr, gp[1] - gr, gr * 2, gr * 2);
+  const gx = (tmpB[0] - view.x) * s + W / 2, gy = (tmpB[1] - view.y) * s + H / 2;
+  const gr = Math.min(Math.max(70 + 40 * G.near, trainKm * s * 0.6), 260);
+  c.globalAlpha = (0.55 + 0.45 * G.far) * a * 0.42;
+  c.drawImage(glowSprite(t.tier), gx - gr, gy - gr, gr * 2, gr * 2);
   c.globalAlpha = 1;
 }
-
-function drawTrain(c, t) {
-  const r = t.route, a = t.alpha, rgb = rgbFor(t), sel = follow === t.id || hovered === t;
-  const { s, wPx, carKm, gapKm } = trainGeom(t), head = t.sDisp, n = t.consist.n;
-
-  // Route ahead for the selected train
-  if (sel) {
-    c.save(); c.strokeStyle = `rgba(${rgb},0.35)`; c.lineWidth = 1.2; c.setLineDash([2, 5]);
-    c.beginPath();
-    pointAt(r, head, tmpA); let q = toScreen(tmpA[0], tmpA[1]);
-    const reach = head + Math.hypot(W, H) / s * 1.2;
-    for (let i = seg(r, head) + 1; i < r.xs.length; i++) {
-      const p = toScreen(r.xs[i], r.ys[i]), cl = clipSeg(q[0], q[1], p[0], p[1], -20, -20, W + 20, H + 20);
-      if (cl) { const dx = p[0] - q[0], dy = p[1] - q[1]; c.moveTo(q[0] + dx * cl[0], q[1] + dy * cl[0]); c.lineTo(q[0] + dx * cl[1], q[1] + dy * cl[1]); }
-      q = p; if (r.cum[i] > reach) break;
+// One rounded rectangle along the direction (ux, uy)
+function addCar(p, cx, cy, ux, uy, hl, hw, rr) {
+  const vx = -uy, vy = ux;
+  const ax = cx + ux * hl + vx * hw, ay = cy + uy * hl + vy * hw, bx = cx + ux * hl - vx * hw, by = cy + uy * hl - vy * hw;
+  const qx = cx - ux * hl - vx * hw, qy = cy - uy * hl - vy * hw, dx = cx - ux * hl + vx * hw, dy = cy - uy * hl + vy * hw;
+  p.moveTo((dx + ax) / 2, (dy + ay) / 2);
+  p.arcTo(ax, ay, bx, by, rr); p.arcTo(bx, by, qx, qy, rr); p.arcTo(qx, qy, dx, dy, rr); p.arcTo(dx, dy, ax, ay, rr);
+  p.closePath();
+}
+// Cars for every train go into a few shared paths (one per color) and are filled together
+function trainBodies(order, G) {
+  const s = view.s, batch = {}, solo = [];
+  const pathFor = (key) => batch[key] || (batch[key] = new Path2D());
+  hits.clear();
+  for (const t of order) {
+    const r = t.route, head = t.sDisp, n = t.consist.n, kind = t.consist.kind;
+    const fading = t.alpha < 0.999, target = fading ? { loco: new Path2D(), car: new Path2D(), t } : null;
+    if (fading) solo.push(target);
+    pointAt(r, head, tmpA);
+    let hx = (tmpA[0] - view.x) * s + W / 2, hy = (tmpA[1] - view.y) * s + H / 2;
+    const pts = [hx, hy]; let x0 = hx, x1 = hx, y0 = hy, y1 = hy;
+    for (let i = 0; i < n; i++) {
+      const sa = head - i * (G.carKm + G.gapKm), sb = sa - G.carKm;
+      if (sa <= 0) break;
+      pointAt(r, sa, tmpA); pointAt(r, Math.max(0, sb), tmpB);
+      const ax = (tmpA[0] - view.x) * s + W / 2, ay = (tmpA[1] - view.y) * s + H / 2;
+      const bx = (tmpB[0] - view.x) * s + W / 2, by = (tmpB[1] - view.y) * s + H / 2;
+      pts.push(bx, by); x0 = Math.min(x0, bx); x1 = Math.max(x1, bx); y0 = Math.min(y0, by); y1 = Math.max(y1, by);
+      const len = Math.hypot(ax - bx, ay - by); if (len < 0.5) continue;
+      const loco = i === 0 || (kind === 'both' && i === n - 1) || (kind === 'double' && i === 1);
+      const p = fading ? (loco ? target.loco : target.car) : pathFor(loco ? t.tier : 'car');
+      addCar(p, (ax + bx) / 2, (ay + by) / 2, (ax - bx) / len, (ay - by) / len, len / 2, G.wPx / 2, Math.min(G.wPx * 0.45, i === 0 ? G.wPx : G.wPx * 0.35));
     }
-    c.stroke(); c.restore();
+    hits.set(t, { pts, n: pts.length, w: G.wPx, x0, x1, y0, y1 });
   }
-
-  pointAt(r, head, tmpA);
-  const hp = toScreen(tmpA[0], tmpA[1]), hitPts = [hp[0], hp[1]];
-  // Cars as rounded rectangles laid along the track, each on its own chord so the train bends
-  const kind = t.consist.kind;
-  for (let i = 0; i < n; i++) {
-    const sa = head - i * (carKm + gapKm), sb = sa - carKm;
-    if (sa <= 0) break;
-    pointAt(r, sa, tmpA); pointAt(r, Math.max(0, sb), tmpB);
-    const pa = toScreen(tmpA[0], tmpA[1]), pb = toScreen(tmpB[0], tmpB[1]);
-    hitPts.push(pb[0], pb[1]);
-    const len = Math.hypot(pa[0] - pb[0], pa[1] - pb[1]); if (len < 0.5) continue;
-    const ang = Math.atan2(pa[1] - pb[1], pa[0] - pb[0]);
-    const loco = i === 0 || ((kind === 'both') && i === n - 1) || (kind === 'double' && i === 1);
-    c.save();
-    c.translate((pa[0] + pb[0]) / 2, (pa[1] + pb[1]) / 2); c.rotate(ang);
-    c.globalAlpha = a;
-    c.fillStyle = loco ? `rgb(${rgb})` : COL.car;
-    c.beginPath(); roundRect(c, -len / 2, -wPx / 2, len, wPx, Math.min(wPx * 0.45, i === 0 ? wPx : wPx * 0.35)); c.fill();
-    if (sel) { c.strokeStyle = `rgba(${rgb},0.9)`; c.lineWidth = 1; c.stroke(); }
-    c.restore();
+  return { batch, solo };
+}
+function drawTrains(order) {
+  const G = geom(view.s);
+  const { batch, solo } = trainBodies(order, G);
+  for (const k of Object.keys(batch)) { ctx.fillStyle = k === 'car' ? COL.car : `rgb(${RGB[k]})`; ctx.fill(batch[k]); }
+  for (const f of solo) {
+    ctx.globalAlpha = f.t.alpha;
+    ctx.fillStyle = COL.car; ctx.fill(f.car); ctx.fillStyle = `rgb(${RGB[f.t.tier]})`; ctx.fill(f.loco);
+    ctx.globalAlpha = 1;
   }
-  hits.set(t.id, { pts: hitPts, w: wPx, reach: 14 });
+}
+function drawSelected(t) { // the route ahead and an outline for the hovered or followed train
+  const r = t.route, rgb = RGB[t.tier], head = t.sDisp, s = view.s;
+  ctx.save(); ctx.strokeStyle = `rgba(${rgb},0.35)`; ctx.lineWidth = 1.2; ctx.setLineDash([2, 5]);
+  const n = routeScreen(r, head, Math.min(r.total, head + Math.hypot(W, H) / s * 1.2));
+  ctx.beginPath(); ctx.moveTo(trailPts[0], trailPts[1]); for (let i = 2; i < n; i += 2) ctx.lineTo(trailPts[i], trailPts[i + 1]); ctx.stroke();
+  ctx.restore();
+  const h = hits.get(t); if (!h) return;
+  ctx.strokeStyle = `rgba(${rgb},0.5)`; ctx.lineWidth = h.w + 3; ctx.lineCap = 'round'; ctx.globalAlpha = 0.35;
+  ctx.beginPath(); ctx.moveTo(h.pts[0], h.pts[1]); for (let i = 2; i < h.n; i += 2) ctx.lineTo(h.pts[i], h.pts[i + 1]); ctx.stroke();
+  ctx.globalAlpha = 1;
 }
 
 // Arrival pings: two thin rings that spread out from the station and fade
@@ -1188,7 +1450,27 @@ function drawPings(c, now) {
   }
 }
 
-let lastT = performance.now();
+// ---------- loading screen ----------
+// The map stays covered until the country-wide terrain, the first full-resolution base map and
+// the first train report are all in, so nothing pops in after it appears
+const loading = {
+  tiles: null, mapReady: false, done: false, t0: performance.now(),
+  step() {
+    if (this.done) return;
+    const tiles = this.tiles, tf = tiles && tiles.total ? tiles.done / tiles.total : 0;
+    const p = 0.15 + 0.55 * tf + (this.mapReady ? 0.15 : 0) + (firstPollDone ? 0.15 : 0);
+    $('veilBar').style.transform = `scaleX(${Math.min(1, p)})`;
+    $('veilMsg').textContent = tf < 1 ? `Loading terrain · ${tiles ? tiles.done : 0} of ${tiles ? tiles.total : '…'} tiles` : !firstPollDone ? 'Finding trains' : 'Drawing the map';
+    if ((this.mapReady && firstPollDone) || performance.now() - this.t0 > 15000) {
+      this.done = true; $('veil').classList.add('gone');
+      setTimeout(() => $('veil').remove(), 800);
+    }
+  },
+};
+setTimeout(() => loading.step(), 15200);
+
+// ---------- frame loop ----------
+let lastT = performance.now(), lastVX = NaN, lastVY = NaN, lastVS = NaN, clipCache = { key: '', near: false };
 function frame(now) {
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
   stepTrains(dt);
@@ -1198,45 +1480,60 @@ function frame(now) {
     else { pointAt(t.route, t.sDisp, tmpA); view.x += (tmpA[0] - view.x) * Math.min(1, dt * 4); view.y += (tmpA[1] - view.y) * Math.min(1, dt * 4); if (goal.active) { goal.ax = view.x; goal.ay = view.y; goal.sx = W / 2; goal.sy = H / 2; } }
   }
   applyZoom(Math.min(1, dt * 9));
-  let ox = (view.x - baseView.x) * view.s, oy = (view.y - baseView.y) * view.s;
-  if (baseDirty || view.s !== baseView.s || Math.abs(ox) > MARGIN - 2 || Math.abs(oy) > MARGIN - 2) { drawBase(); ox = oy = 0; }
+  const viewChanged = view.x !== lastVX || view.y !== lastVY || view.s !== lastVS;
+  if (viewChanged) { lastVX = view.x; lastVY = view.y; lastVS = view.s; if (!follow || goal.active || drag || pinch) lastViewChange = now; hoverDirty = true; }
+  requestBase(now);
 
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.drawImage(base, Math.round((MARGIN + ox) * DPR), Math.round((MARGIN + oy) * DPR), canvas.width, canvas.height, 0, 0, canvas.width, canvas.height);
-  hits.clear();
+  drawBase();
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   const pad = 400 / view.s + 50;
   const [vx0, vy0] = toWorld(0, 0), [vx1, vy1] = toWorld(W, H);
-  const order = [...trains.values()].sort((a, b) => (a === hovered || a.id === follow) - (b === hovered || b.id === follow)).filter(t => {
+  const order = [];
+  for (const t of trains.values()) {
     pointAt(t.route, t.sDisp, tmpA);
-    return !(tmpA[0] < vx0 - pad || tmpA[0] > vx1 + pad || tmpA[1] < vy0 - pad || tmpA[1] > vy1 + pad);
-  });
-  // Glows, trails and pings never spill past the US outline. Clipping costs a full-screen pass, so
-  // it's skipped when no stretch of outline is near the view (the view is then all land or all water).
-  ctx.save();
-  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  const gm = 300 / view.s, outlineNear = layers.coast.chunks.some(ch => ch.x1 >= vx0 - gm && ch.x0 <= vx1 + gm && ch.y1 >= vy0 - gm && ch.y0 <= vy1 + gm);
-  if (outlineNear || !inUS(view.x, view.y)) {
-    ctx.setTransform(view.s * DPR, 0, 0, view.s * DPR, (W / 2 - view.x * view.s) * DPR, (H / 2 - view.y * view.s) * DPR);
-    ctx.clip(layers.land, 'evenodd');
+    if (tmpA[0] < vx0 - pad || tmpA[0] > vx1 + pad || tmpA[1] < vy0 - pad || tmpA[1] > vy1 + pad) continue;
+    order.push(t);
+  }
+  // Glows, trails and pings never spill past the US outline. Clipping is skipped when no stretch
+  // of outline is near the view, and uses a coarser outline when zoomed out.
+  const ck = Math.round(vx0) + ',' + Math.round(vy0) + ',' + Math.round(vx1) + ',' + Math.round(vy1);
+  if (ck !== clipCache.key) {
+    const gm = 300 / view.s;
+    clipCache = { key: ck, near: coastBoxes.some(b => b[2] >= vx0 - gm && b[0] <= vx1 + gm && b[3] >= vy0 - gm && b[1] <= vy1 + gm) };
+  }
+  if (order.length || pings.length) {
+    ctx.save();
+    if (clipCache.near) {
+      ctx.setTransform(view.s * DPR, 0, 0, view.s * DPR, (W / 2 - view.x * view.s) * DPR, (H / 2 - view.y * view.s) * DPR);
+      ctx.clip(landClip(view.s), 'evenodd');
+      ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    }
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    const G = geom(view.s);
+    for (const t of order) drawTrainFx(ctx, t, G);
+    drawPings(ctx, now);
+    ctx.restore();
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   }
-  for (const t of order) drawTrainFx(ctx, t);
-  drawPings(ctx, now);
-  ctx.restore();
-  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  for (const t of order) drawTrain(ctx, t);
+  drawTrains(order);
+  const sel = hovered && trains.has(hovered.id) ? hovered : null, fol = follow ? trains.get(follow) : null;
+  if (fol && order.includes(fol)) drawSelected(fol);
+  if (sel && sel !== fol && order.includes(sel)) drawSelected(sel);
   if (hoveredStation) {
     const p = toScreen(hoveredStation.x, hoveredStation.y);
     ctx.strokeStyle = 'rgba(228,238,240,0.7)'; ctx.lineWidth = 1.2;
     ctx.beginPath(); ctx.arc(p[0], p[1], 5, 0, Math.PI * 2); ctx.stroke();
   }
-  // Re-check hover every frame: trains move under a still cursor, and the map moves while following
-  if (mouseIn) hover(mouse[0], mouse[1]);
+  // Hover is re-checked when the pointer or map moves, and a few times a second as trains move
+  if (mouseIn && (hoverDirty || now - lastHover > 150)) { hover(now); hoverDirty = false; lastHover = now; }
   renderInfo(now);
   requestAnimationFrame(frame);
 }
 
 resize();
+startRenderer();
 requestAnimationFrame(frame);
 poll();
 })();
