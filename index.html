@@ -545,7 +545,7 @@ async function fetchMissingStations(codes) {
   if (stationsFetched || !codes.length) return;
   stationsFetched = true;
   try {
-    const res = await fetch(API + '/stations'); if (!res.ok) return;
+    const res = await fetchWithTimeout(API + '/stations'); if (!res.ok) return;
     const all = await res.json();
     for (const [code, m] of Object.entries(all)) {
       if (stations[code] || !isFinite(m.lat) || !isFinite(m.lon)) continue;
@@ -601,14 +601,21 @@ function ingest(data, fetchedAt) {
   for (const st of trains.values()) if (!seen.has(st.id) && !st.gone) {
     st.gone = true;
     const k = MODEL.finalArrival(st);
-    if (k >= 0) { pointAt(st.route, st.route.stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[st.tier] }); logArrival(st, k); announce(st, k); }
+    if (k >= 0 && !document.hidden && !resyncPending) { pointAt(st.route, st.route.stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[st.tier] }); logArrival(st, k); announce(st, k); }
   }
   if (missing.size) fetchMissingStations([...missing]);
 }
 
+// Requests that never answer would otherwise stop the polling for good
+function fetchWithTimeout(url, opts = {}, ms = 20000) {
+  const ac = new AbortController(), timer = setTimeout(() => ac.abort(), ms);
+  return fetch(url, { ...opts, signal: ac.signal }).finally(() => clearTimeout(timer));
+}
+let pollTimer = null, polling = false, lastPollAt = 0;
 async function poll() {
+  if (polling) return; polling = true; clearTimeout(pollTimer); lastPollAt = Date.now();
   try {
-    const res = await fetch(API + '/trains', { cache: 'no-store' });
+    const res = await fetchWithTimeout(API + '/trains', { cache: 'no-store' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json(), at = Date.now();
     ingest(data, at);
@@ -623,7 +630,7 @@ async function poll() {
   }
   firstPollDone = true; loading.step();
   updateCount(); renderList();
-  setTimeout(poll, POLL_MS);
+  polling = false; pollTimer = setTimeout(poll, POLL_MS);
 }
 function updateCount() {
   let n = 0; for (const t of trains.values()) if (!t.gone) n++;
@@ -722,6 +729,25 @@ MODEL.arrivals = (st) => {
   return out;
 };
 /*END MODEL*/
+// Catching up after time away (a background tab, a sleeping computer): the browser stops drawing,
+// but the feed keeps updating. Trains jump to where they are now, every stop reached in the meantime
+// is marked as seen, and queued pings and notices are dropped, so nothing replays on return.
+let resyncPending = false;
+function resync() {
+  resyncPending = false;
+  const now = Date.now();
+  for (const t of trains.values()) {
+    if (!t.route || t.tMeas == null) continue;
+    t.sDisp = MODEL.target(t, now); t.vDisp = t.gone ? 0 : t.vMeas;
+    t.pinged = new Set(); MODEL.reached(t);
+  }
+  pings.length = 0; toastQueue.length = 0; clearTimeout(toastTimer); toastTimer = null;
+  $('toasts').replaceChildren();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { resyncPending = true; return; }
+  if (Date.now() - lastPollAt > 10000) poll(); // fresh data straight away
+});
 function stepTrains(dt) {
   const now = Date.now();
   for (const [id, t] of trains) {
@@ -729,9 +755,12 @@ function stepTrains(dt) {
     if (t.gone && t.alpha <= 0) { trains.delete(id); continue; }
     MODEL.step(t, dt, now); // after a jump, stops it skipped are dropped by MODEL.arrivals; the one it lands on can still ping
     if (t.gone) continue;
+    const live = now - t.tMeas < 10 * 60000; // a stale report can still confirm a stop, but it isn't news
     for (const k of MODEL.arrivals(t)) {
+      if (!live) continue;
       placeAt(t.route, t.route.stopS[k], tmpA);
       pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[t.tier] });
+      if (pings.length > MAX_PINGS) pings.shift();
       logArrival(t, k);
       announce(t, k);
     }
@@ -1186,6 +1215,8 @@ function tileWorker() {
   }
 
   const td = new TextDecoder();
+  // A tile request that never answers would hold its slot in the queue forever
+  const fetchT = (url) => { const ac = new AbortController(), t = setTimeout(() => ac.abort(), 20000); return fetch(url, { signal: ac.signal }).finally(() => clearTimeout(t)); };
   // ---- minimal protobuf / Mapbox Vector Tile reader ----
   function decodeMVT(buf) {
     let pos = 0;
@@ -1251,7 +1282,7 @@ function tileWorker() {
     return null;
   }
   async function bytesOf(url) {
-    const res = await fetch(url); if (!res.ok) throw new Error('HTTP ' + res.status);
+    const res = await fetchT(url); if (!res.ok) throw new Error('HTTP ' + res.status);
     let b = new Uint8Array(await res.arrayBuffer());
     if (b[0] === 0x1f && b[1] === 0x8b) b = new Uint8Array(await new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
     return b;
@@ -1286,7 +1317,7 @@ function tileWorker() {
     const key = z + '/' + x + '/' + y;
     if (elevCache.has(key)) { const v = elevCache.get(key); elevCache.delete(key); elevCache.set(key, v); return v; }
     const p = (async () => {
-      const res = await fetch(tmpl.replace('{z}', z).replace('{x}', x).replace('{y}', y)); if (!res.ok) return null;
+      const res = await fetchT(tmpl.replace('{z}', z).replace('{x}', x).replace('{y}', y)); if (!res.ok) return null;
       const bmp = await createImageBitmap(await res.blob());
       const oc = new OffscreenCanvas(256, 256), g = oc.getContext('2d', { willReadFrequently: true });
       g.drawImage(bmp, 0, 0); const px = g.getImageData(0, 0, 256, 256).data, e = new Float32Array(65536);
@@ -1454,9 +1485,12 @@ function rendererMain() {
       new Function('self', m.tileSrc)(fake);
       decoders.push({ postMessage: (msg) => fake.onmessage({ data: msg }) });
     }
-    fetch(VEC_TILEJSON).then(r => r.ok ? r.json() : null).then(j => {
+    // Street tiles' index; retried every 2 minutes if the service can't be reached
+    const loadIndex = () => fetch(VEC_TILEJSON).then(r => r.ok ? r.json() : null).then(j => {
       if (j && j.tiles && j.tiles[0]) { vecTemplate = j.tiles[0]; vecMax = Math.min(14, j.maxzoom || 14); requestRender(50); }
-    }).catch(() => {});
+      else setTimeout(loadIndex, 120000);
+    }).catch(() => setTimeout(loadIndex, 120000));
+    loadIndex();
     preload();
   }
 
@@ -1472,6 +1506,7 @@ function rendererMain() {
       e = { kind, z, x, y, key, state: 'queued', used: stamp, pin: !!pin };
       cache.set(key, e); queue.push({ e, prio });
     } else if (e.state === 'queued') { const q = queue.find(q => q.e === e); if (q) q.prio = Math.min(q.prio, prio); }
+    else if (e.state === 'error' && Date.now() - e.errAt > 60000) { e.state = 'queued'; queue.push({ e, prio }); } // failed tiles retry after a minute
     e.used = stamp; if (pin) e.pin = true;
     return e;
   }
@@ -1490,7 +1525,7 @@ function rendererMain() {
   function onDecoded(ev) {
     const m = ev.data, e = cache.get(m.key); inflight--;
     if (e) {
-      if (m.error) e.state = 'error';
+      if (m.error) { e.state = 'error'; e.errAt = Date.now(); }
       else if (e.kind === 'dem') {
         const cv = mk(256, 256); cv.getContext('2d').putImageData(new ImageData(m.img, 256, 256), 0, 0);
         const seg = (a) => { if (!a.length) return null; const p = new Path2D(); for (let i = 0; i < a.length; i += 4) { p.moveTo(a[i], a[i + 1]); p.lineTo(a[i + 2], a[i + 3]); } return p; };
@@ -2018,6 +2053,7 @@ function drawSelected(t) { // the route ahead and an outline for the hovered or 
 
 // Arrival pings: two thin rings that spread out from the station and fade
 const PING_MS = 2600;
+const MAX_PINGS = 40;
 function drawPings(c, now) {
   for (let i = pings.length - 1; i >= 0; i--) if (now - pings[i].t0 > PING_MS + 600) pings.splice(i, 1);
   c.lineWidth = 1.2;
@@ -2057,6 +2093,7 @@ setTimeout(() => loading.step(), 15200);
 // ---------- frame loop ----------
 let lastT = performance.now(), lastVX = NaN, lastVY = NaN, lastVS = NaN, clipCache = { key: '', near: false };
 function frame(now) {
+  if (resyncPending || now - lastT > 3000) resync(); // back from a hidden tab, or frames stalled
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
   stepTrains(dt);
   if (stepFlight(now)) { /* the flight moves the camera */ }

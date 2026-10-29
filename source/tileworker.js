@@ -14,6 +14,8 @@ function tileWorker() {
   }
 
   const td = new TextDecoder();
+  // A tile request that never answers would hold its slot in the queue forever
+  const fetchT = (url) => { const ac = new AbortController(), t = setTimeout(() => ac.abort(), 20000); return fetch(url, { signal: ac.signal }).finally(() => clearTimeout(t)); };
   // ---- minimal protobuf / Mapbox Vector Tile reader ----
   function decodeMVT(buf) {
     let pos = 0;
@@ -79,7 +81,7 @@ function tileWorker() {
     return null;
   }
   async function bytesOf(url) {
-    const res = await fetch(url); if (!res.ok) throw new Error('HTTP ' + res.status);
+    const res = await fetchT(url); if (!res.ok) throw new Error('HTTP ' + res.status);
     let b = new Uint8Array(await res.arrayBuffer());
     if (b[0] === 0x1f && b[1] === 0x8b) b = new Uint8Array(await new Response(new Blob([b]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
     return b;
@@ -114,7 +116,7 @@ function tileWorker() {
     const key = z + '/' + x + '/' + y;
     if (elevCache.has(key)) { const v = elevCache.get(key); elevCache.delete(key); elevCache.set(key, v); return v; }
     const p = (async () => {
-      const res = await fetch(tmpl.replace('{z}', z).replace('{x}', x).replace('{y}', y)); if (!res.ok) return null;
+      const res = await fetchT(tmpl.replace('{z}', z).replace('{x}', x).replace('{y}', y)); if (!res.ok) return null;
       const bmp = await createImageBitmap(await res.blob());
       const oc = new OffscreenCanvas(256, 256), g = oc.getContext('2d', { willReadFrequently: true });
       g.drawImage(bmp, 0, 0); const px = g.getImageData(0, 0, 256, 256).data, e = new Float32Array(65536);

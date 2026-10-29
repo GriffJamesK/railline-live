@@ -319,7 +319,7 @@ async function fetchMissingStations(codes) {
   if (stationsFetched || !codes.length) return;
   stationsFetched = true;
   try {
-    const res = await fetch(API + '/stations'); if (!res.ok) return;
+    const res = await fetchWithTimeout(API + '/stations'); if (!res.ok) return;
     const all = await res.json();
     for (const [code, m] of Object.entries(all)) {
       if (stations[code] || !isFinite(m.lat) || !isFinite(m.lon)) continue;
@@ -375,14 +375,21 @@ function ingest(data, fetchedAt) {
   for (const st of trains.values()) if (!seen.has(st.id) && !st.gone) {
     st.gone = true;
     const k = MODEL.finalArrival(st);
-    if (k >= 0) { pointAt(st.route, st.route.stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[st.tier] }); logArrival(st, k); announce(st, k); }
+    if (k >= 0 && !document.hidden && !resyncPending) { pointAt(st.route, st.route.stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[st.tier] }); logArrival(st, k); announce(st, k); }
   }
   if (missing.size) fetchMissingStations([...missing]);
 }
 
+// Requests that never answer would otherwise stop the polling for good
+function fetchWithTimeout(url, opts = {}, ms = 20000) {
+  const ac = new AbortController(), timer = setTimeout(() => ac.abort(), ms);
+  return fetch(url, { ...opts, signal: ac.signal }).finally(() => clearTimeout(timer));
+}
+let pollTimer = null, polling = false, lastPollAt = 0;
 async function poll() {
+  if (polling) return; polling = true; clearTimeout(pollTimer); lastPollAt = Date.now();
   try {
-    const res = await fetch(API + '/trains', { cache: 'no-store' });
+    const res = await fetchWithTimeout(API + '/trains', { cache: 'no-store' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json(), at = Date.now();
     ingest(data, at);
@@ -397,7 +404,7 @@ async function poll() {
   }
   firstPollDone = true; loading.step();
   updateCount(); renderList();
-  setTimeout(poll, POLL_MS);
+  polling = false; pollTimer = setTimeout(poll, POLL_MS);
 }
 function updateCount() {
   let n = 0; for (const t of trains.values()) if (!t.gone) n++;
@@ -496,6 +503,25 @@ MODEL.arrivals = (st) => {
   return out;
 };
 /*END MODEL*/
+// Catching up after time away (a background tab, a sleeping computer): the browser stops drawing,
+// but the feed keeps updating. Trains jump to where they are now, every stop reached in the meantime
+// is marked as seen, and queued pings and notices are dropped, so nothing replays on return.
+let resyncPending = false;
+function resync() {
+  resyncPending = false;
+  const now = Date.now();
+  for (const t of trains.values()) {
+    if (!t.route || t.tMeas == null) continue;
+    t.sDisp = MODEL.target(t, now); t.vDisp = t.gone ? 0 : t.vMeas;
+    t.pinged = new Set(); MODEL.reached(t);
+  }
+  pings.length = 0; toastQueue.length = 0; clearTimeout(toastTimer); toastTimer = null;
+  $('toasts').replaceChildren();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { resyncPending = true; return; }
+  if (Date.now() - lastPollAt > 10000) poll(); // fresh data straight away
+});
 function stepTrains(dt) {
   const now = Date.now();
   for (const [id, t] of trains) {
@@ -503,9 +529,12 @@ function stepTrains(dt) {
     if (t.gone && t.alpha <= 0) { trains.delete(id); continue; }
     MODEL.step(t, dt, now); // after a jump, stops it skipped are dropped by MODEL.arrivals; the one it lands on can still ping
     if (t.gone) continue;
+    const live = now - t.tMeas < 10 * 60000; // a stale report can still confirm a stop, but it isn't news
     for (const k of MODEL.arrivals(t)) {
+      if (!live) continue;
       placeAt(t.route, t.route.stopS[k], tmpA);
       pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[t.tier] });
+      if (pings.length > MAX_PINGS) pings.shift();
       logArrival(t, k);
       announce(t, k);
     }
@@ -1134,6 +1163,7 @@ function drawSelected(t) { // the route ahead and an outline for the hovered or 
 
 // Arrival pings: two thin rings that spread out from the station and fade
 const PING_MS = 2600;
+const MAX_PINGS = 40;
 function drawPings(c, now) {
   for (let i = pings.length - 1; i >= 0; i--) if (now - pings[i].t0 > PING_MS + 600) pings.splice(i, 1);
   c.lineWidth = 1.2;
@@ -1173,6 +1203,7 @@ setTimeout(() => loading.step(), 15200);
 // ---------- frame loop ----------
 let lastT = performance.now(), lastVX = NaN, lastVY = NaN, lastVS = NaN, clipCache = { key: '', near: false };
 function frame(now) {
+  if (resyncPending || now - lastT > 3000) resync(); // back from a hidden tab, or frames stalled
   const dt = Math.min(0.1, (now - lastT) / 1000); lastT = now;
   stepTrains(dt);
   if (stepFlight(now)) { /* the flight moves the camera */ }

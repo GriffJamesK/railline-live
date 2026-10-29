@@ -65,9 +65,12 @@ function rendererMain() {
       new Function('self', m.tileSrc)(fake);
       decoders.push({ postMessage: (msg) => fake.onmessage({ data: msg }) });
     }
-    fetch(VEC_TILEJSON).then(r => r.ok ? r.json() : null).then(j => {
+    // Street tiles' index; retried every 2 minutes if the service can't be reached
+    const loadIndex = () => fetch(VEC_TILEJSON).then(r => r.ok ? r.json() : null).then(j => {
       if (j && j.tiles && j.tiles[0]) { vecTemplate = j.tiles[0]; vecMax = Math.min(14, j.maxzoom || 14); requestRender(50); }
-    }).catch(() => {});
+      else setTimeout(loadIndex, 120000);
+    }).catch(() => setTimeout(loadIndex, 120000));
+    loadIndex();
     preload();
   }
 
@@ -83,6 +86,7 @@ function rendererMain() {
       e = { kind, z, x, y, key, state: 'queued', used: stamp, pin: !!pin };
       cache.set(key, e); queue.push({ e, prio });
     } else if (e.state === 'queued') { const q = queue.find(q => q.e === e); if (q) q.prio = Math.min(q.prio, prio); }
+    else if (e.state === 'error' && Date.now() - e.errAt > 60000) { e.state = 'queued'; queue.push({ e, prio }); } // failed tiles retry after a minute
     e.used = stamp; if (pin) e.pin = true;
     return e;
   }
@@ -101,7 +105,7 @@ function rendererMain() {
   function onDecoded(ev) {
     const m = ev.data, e = cache.get(m.key); inflight--;
     if (e) {
-      if (m.error) e.state = 'error';
+      if (m.error) { e.state = 'error'; e.errAt = Date.now(); }
       else if (e.kind === 'dem') {
         const cv = mk(256, 256); cv.getContext('2d').putImageData(new ImageData(m.img, 256, 256), 0, 0);
         const seg = (a) => { if (!a.length) return null; const p = new Path2D(); for (let i = 0; i < a.length; i += 4) { p.moveTo(a[i], a[i + 1]); p.lineTo(a[i + 2], a[i + 3]); } return p; };
