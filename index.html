@@ -119,6 +119,12 @@ canvas.over-train { cursor: pointer; }
 .credit { position: fixed; right: max(66px, calc(env(safe-area-inset-right, 0px) + 66px)); bottom: calc(16px + env(safe-area-inset-bottom, 0px)); font-size: 11px; color: #5c686f; }
 .credit a { color: inherit; }
 .credit { max-width: calc(100vw - 380px); text-align: right; }
+#debug {
+  right: max(16px, env(safe-area-inset-right, 0px)); top: calc(16px + env(safe-area-inset-top, 0px));
+  width: min(520px, calc(100vw - 32px)); max-height: 40vh; overflow-y: auto; padding: 10px 12px;
+  font: 11px/1.5 var(--font-data); color: var(--ink-dim); display: grid; gap: 4px;
+}
+#debug .h { color: var(--ink); font: 600 12px var(--font-ui); }
 #veil {
   position: fixed; inset: 0; z-index: 20; background: var(--ground); display: grid; place-items: center;
   transition: opacity 0.7s ease;
@@ -150,6 +156,7 @@ canvas.over-train { cursor: pointer; }
 <div id="tip" class="card" hidden></div>
 <div id="veil"><div class="in"><div class="t">Rail <span>Live</span></div><div class="bar"><i id="veilBar"></i></div><div id="veilMsg">Loading map</div></div></div>
 <div id="stip" class="card" hidden></div>
+<div id="debug" class="card" hidden aria-live="polite"></div>
 <div id="info" class="card" hidden aria-live="polite">
   <div class="head"><span class="eyebrow">Following</span><span class="eyebrow" id="infoPct"></span></div>
   <div><div class="ttl" id="infoTitle"></div><div class="route" id="infoRoute"></div></div>
@@ -413,6 +420,7 @@ function ingest(data, fetchedAt) {
       pointAt(st.route, st.sDisp, tmpA);
       st.sDisp = locate(route, tmpA[0], tmpA[1], null).s; st.route = route; st.sig = null;
       st.pinged = new Set(); markPassed(st);
+      (st.stopStatus || []).forEach((x, k) => { if (MODEL.ARRIVE(x)) st.pinged.add(k); });
     }
     const loc = locate(route, x, y, st ? st.sDisp : null);
     if (loc.d > 60) continue; // position nowhere near its scheduled route
@@ -428,8 +436,10 @@ function ingest(data, fetchedAt) {
     }
     MODEL.report(st, { sig, s: loc.s, ts: ts ?? fetchedAt, v });
     st.capS = MODEL.nextStop(route.stopS, knownStops.findIndex(s => s.status === 'Enroute'), st.sMeas, route.total);
+    st.stops = knownStops; st.stopStatus = knownStops.map(s => s.status);
     if (!st.placed) { // first sighting: start where the train should be by now
       st.placed = true; st.sDisp = MODEL.target(st, Date.now()); st.vDisp = v; markPassed(st);
+      st.stopStatus.forEach((x, k) => { if (MODEL.ARRIVE(x)) st.pinged.add(k); });
     }
     const late = lateness(t);
     Object.assign(st, { info: t, late, tier: tier(late), consist: consistFor(t.routeName || ''), gone: false });
@@ -520,21 +530,56 @@ const MODEL = {
     return 'glide';
   },
 };
+MODEL.ARRIVE = (status) => status === 'Station' || status === 'Departed';
+// Stops to ping now. A ping needs the feed to confirm the train reached the stop (its status is
+// "Station" or "Departed", or its position report has it stopped at the stop), and fires when the
+// drawn train is at the stop, so it lines up on screen.
+// A confirmed stop the drawn train is already well past is dropped instead of pinging late.
+MODEL.arrivals = (st) => {
+  const out = [], stopS = st.route.stopS, status = st.stopStatus || [];
+  for (let k = 1; k < stopS.length; k++) {
+    if (st.pinged.has(k)) continue;
+    // Evidence of arrival: the feed's status for the stop, or a report of the train stopped right at it
+    const stoppedThere = st.vMeas < 0.0005 && Math.abs(st.sMeas - stopS[k]) < 0.3;
+    if (!MODEL.ARRIVE(status[k]) && !stoppedThere) continue;
+    const d = st.sDisp - stopS[k];
+    if (d > 0.5) { st.pinged.add(k); continue; }
+    if (d >= -0.15) { st.pinged.add(k); out.push(k); }
+  }
+  return out;
+};
 /*END MODEL*/
 function stepTrains(dt) {
   const now = Date.now();
   for (const [id, t] of trains) {
     t.alpha = t.gone ? Math.max(0, t.alpha - dt / 2) : Math.min(1, t.alpha + dt / 1.5);
     if (t.gone && t.alpha <= 0) { trains.delete(id); continue; }
-    if (MODEL.step(t, dt, now) === 'snap') { markPassed(t); continue; }
-    // Arrival ping when the drawn train reaches a stop
-    const stopS = t.route.stopS;
-    for (let k = 1; k < stopS.length; k++) {
-      if (t.pinged.has(k) || t.sDisp < stopS[k] - 0.08) continue;
-      t.pinged.add(k);
-      if (!t.gone) { pointAt(t.route, stopS[k], tmpA); pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[t.tier] }); }
+    MODEL.step(t, dt, now); // after a jump, stops it skipped are dropped by MODEL.arrivals; the one it lands on can still ping
+    if (t.gone) continue;
+    for (const k of MODEL.arrivals(t)) {
+      pointAt(t.route, t.route.stopS[k], tmpA);
+      pings.push({ x: tmpA[0], y: tmpA[1], t0: performance.now(), rgb: RGB[t.tier] });
+      logArrival(t, k);
     }
   }
+}
+// Arrival log, shown with #debug in the address: what the feed said when each ping fired
+const arrivalLog = [], DEBUG = location.hash === '#debug';
+function logArrival(t, k) {
+  const s = t.stops && t.stops[k], i = t.info;
+  const e = { at: new Date(), train: `${i.routeName} ${i.trainNum}`, stop: s ? placeName(s.name, s.code) : '?', status: s ? s.status : '?',
+    arr: s ? fmtTime(s.arr || s.dep, s.tz) : '–', sched: s ? fmtTime(s.schArr || s.schDep, s.tz) : '–', gap: (t.sDisp - t.sMeas).toFixed(2), report: ago(t.tMeas) };
+  arrivalLog.unshift(e); arrivalLog.length = Math.min(arrivalLog.length, 40);
+  if (DEBUG) { console.info('[arrival]', e); renderDebug(); }
+}
+function renderDebug() {
+  const el = $('debug'); if (!el) return;
+  el.hidden = false;
+  el.replaceChildren(...[Object.assign(document.createElement('div'), { className: 'h', textContent: `Arrival pings (${arrivalLog.length})` })].concat(arrivalLog.map(e => {
+    const d = document.createElement('div');
+    d.textContent = `${e.at.toLocaleTimeString()} · ${e.train} · ${e.stop} · feed: ${e.status}, arr ${e.arr} (sched ${e.sched}) · report ${e.report} · drawn ${e.gap} km from report`;
+    return d;
+  })));
 }
 function markPassed(t) { t.route.stopS.forEach((ss, k) => { if (ss <= t.sDisp + 0.08) t.pinged.add(k); }); }
 
@@ -1749,6 +1794,7 @@ function frame(now) {
 }
 
 resize();
+if (DEBUG) renderDebug();
 startRenderer();
 requestAnimationFrame(frame);
 poll();

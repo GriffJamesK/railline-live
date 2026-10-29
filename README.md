@@ -11,6 +11,9 @@ Open `index.html` in a browser, or visit the GitHub Pages site for this repo.
 - Scroll to zoom, drag to pan, click a train to follow it.
 - Colors: teal on time, amber 15+ minutes late, coral 1+ hour late.
 - Car counts are estimates by route; the feed doesn't report them.
+- A ripple marks a train arriving at a stop. It needs evidence from the feed (the stop's status is
+  "Station" or "Departed", or a position report has the train stopped at the stop). Add `#debug` to
+  the address to see a log of each ping with what the feed said at that moment.
 
 Data: [Amtraker](https://amtraker.com) (train positions, ODC-By; API docs at https://api.amtraker.com/docs), FRA (track and stations), AWS Terrain Tiles (elevation),
 OpenFreeMap / © OpenStreetMap contributors (streets), Natural Earth, us-atlas.
