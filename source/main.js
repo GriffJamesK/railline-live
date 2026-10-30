@@ -159,14 +159,16 @@ function buildRoute(codes) {
   if (routeCache.has(key)) return routeCache.get(key);
   const xs = [], ys = [];
   const add = (x, y) => { const n = xs.length; if (n && Math.abs(xs[n - 1] - x) < 1e-4 && Math.abs(ys[n - 1] - y) < 1e-4) return; xs.push(x); ys.push(y); };
-  const stops = [];
+  const stops = [], legTrack = [true]; // legTrack[k]: the leg into stop k follows real track
   for (let i = 0; i < codes.length; i++) {
     const s = stations[codes[i]];
     if (i === 0) { add(s.x, s.y); stops.push(0); continue; }
     const a = stations[codes[i - 1]], b = s;
     const straight = Math.hypot(b.x - a.x, b.y - a.y);
     const path = a.node >= 0 && b.node >= 0 ? dijkstra(a.node, b.node) : null;
-    if (path && path.len < straight * 2.2 + 40) {
+    const onTrack = !!(path && path.len < straight * 2.2 + 40);
+    legTrack.push(onTrack);
+    if (onTrack) {
       for (const [ei, from] of path.steps) {
         const p = edges[ei].pts, fwd = edges[ei].a === from;
         if (fwd) for (let k = 0; k < p.length; k += 2) add(p[k], p[k + 1]);
@@ -178,7 +180,7 @@ function buildRoute(codes) {
   }
   const n = xs.length, cum = new Float64Array(n);
   for (let i = 1; i < n; i++) cum[i] = cum[i - 1] + Math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]);
-  const r = { xs: Float64Array.from(xs), ys: Float64Array.from(ys), cum, total: cum[n - 1] || 0, stopS: stops.map(i => cum[i]) };
+  const r = { xs: Float64Array.from(xs), ys: Float64Array.from(ys), cum, total: cum[n - 1] || 0, stopS: stops.map(i => cum[i]), legTrack };
   routeCache.set(key, r);
   return r;
 }
@@ -263,7 +265,7 @@ function snapBlock(r, b) {
 // Where to draw route position s: the routed point, moved onto OSM rail by the current snap strength
 function placeAt(r, s, out) {
   pointAt(r, s, out);
-  if (rail.k <= 0) return out;
+  if (rail.k <= 0 || r.noSnap) return out;
   const i = Math.max(0, Math.min(r.total, s)) / SNAP_STEP, b = Math.floor(i / SNAP_BLOCK), blk = snapBlock(r, b);
   const j = i - b * SNAP_BLOCK, j0 = Math.min(SNAP_BLOCK - 1, Math.floor(j)), f = j - j0;
   out[0] += (blk.ox[j0] + (blk.ox[j0 + 1] - blk.ox[j0]) * f) * rail.k;
@@ -383,6 +385,10 @@ function ingest(data, fetchedAt) {
     const loc = locate(route, x, y, st ? st.sDisp : null);
     if (loc.d > 60) continue; // position nowhere near its scheduled route
     const v = Math.max(0, (+t.velocity || 0) * MPH);
+    // No known track for the stretch it's on (e.g. Brightline's line isn't in the track data), or the
+    // report is well off the routed line: draw it where it's reported, not forced onto a straight line
+    let leg = 1; while (leg < route.stopS.length - 1 && route.stopS[leg] < loc.s) leg++;
+    const free = !route.legTrack[leg] || loc.d > 1.5;
     // When the report was taken. The feed repeats the same report for several polls; it keeps the
     // time it was first seen, so the train keeps moving from it instead of being pulled back
     let ts = parseTime(t.lastValTS);
@@ -398,6 +404,12 @@ function ingest(data, fetchedAt) {
     if (!st.placed) { // first sighting: start where the train should be by now
       st.placed = true; st.sDisp = MODEL.target(st, Date.now()); st.vDisp = v; MODEL.reached(st);
     }
+    if (!st.reps || st.reps[st.reps.length - 1].sig !== sig) {
+      (st.reps = st.reps || []).push({ x, y, sig, ts: ts ?? fetchedAt });
+      if (st.reps.length > 6) st.reps.shift();
+    }
+    if (!free) { st.trail = null; st.freeRoute = null; }
+    st.free = free;
     const late = lateness(t);
     Object.assign(st, { info: t, late, tier: tier(late), consist: consistFor(t), px: x, py: y, gone: false });
     seen.add(id);
@@ -561,12 +573,44 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) { resyncPending = true; return; }
   if (Date.now() - lastPollAt > 10000) poll(); // fresh data straight away
 });
+// GPS-following trains: the head glides toward the last report carried on at the reported speed, in
+// the direction between its last two reports; cars and trail follow the path the head has drawn
+function stepFree(t, dt, now) {
+  const reps = t.reps, last = reps[reps.length - 1];
+  let dx = 0, dy = 0;
+  for (let i = reps.length - 2; i >= 0; i--) {
+    const d = Math.hypot(last.x - reps[i].x, last.y - reps[i].y);
+    if (d > 0.05) { dx = (last.x - reps[i].x) / d; dy = (last.y - reps[i].y) / d; break; }
+  }
+  if (!dx && !dy) { pointAt(t.route, t.sDisp - 0.05, tmpA); pointAt(t.route, t.sDisp + 0.05, tmpB); const d = Math.hypot(tmpB[0] - tmpA[0], tmpB[1] - tmpA[1]) || 1; dx = (tmpB[0] - tmpA[0]) / d; dy = (tmpB[1] - tmpA[1]) / d; }
+  const age = Math.min(600, Math.max(0, (now - last.ts) / 1000)), v = t.vMeas;
+  const tx = last.x + dx * v * age, ty = last.y + dy * v * age;
+  // A fresh path starts with a short run behind the train, so its cars and trail draw right away
+  if (!t.trail || Math.hypot(tx - t.fx, ty - t.fy) > 5) { t.fx = tx; t.fy = ty; t.trail = [tx - dx * 8, ty - dy * 8, tx, ty]; }
+  else {
+    const k = Math.min(1, dt * 0.6);
+    t.fx += dx * v * dt + (tx - t.fx) * k; t.fy += dy * v * dt + (ty - t.fy) * k;
+  }
+  const tr = t.trail, n = tr.length;
+  if (Math.hypot(t.fx - tr[n - 2], t.fy - tr[n - 1]) > 0.02) tr.push(t.fx, t.fy);
+  else if (n > 2) { tr[n - 2] = t.fx; tr[n - 1] = t.fy; }
+  // keep about 10 km of path (zoomed out, cars are drawn larger than life and a long train needs room)
+  let len = 0, cut = 0;
+  for (let i = tr.length - 2; i > 0; i -= 2) { len += Math.hypot(tr[i] - tr[i - 2], tr[i + 1] - tr[i - 1]); if (len > 10) { cut = i - 2; break; } }
+  if (cut > 0) tr.splice(0, cut);
+  const m = tr.length / 2, xs = new Float64Array(m + (m === 1 ? 1 : 0)), ys = new Float64Array(xs.length), cum = new Float64Array(xs.length);
+  for (let i = 0; i < m; i++) { xs[i] = tr[i * 2]; ys[i] = tr[i * 2 + 1]; if (i) cum[i] = cum[i - 1] + Math.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]); }
+  if (m === 1) { xs[1] = xs[0] + dx * 1e-3; ys[1] = ys[0] + dy * 1e-3; cum[1] = 1e-3; }
+  t.freeRoute = { xs, ys, cum, total: cum[cum.length - 1], noSnap: true };
+}
 function stepTrains(dt) {
   const now = Date.now();
   for (const [id, t] of trains) {
     t.alpha = t.gone ? Math.max(0, t.alpha - dt / 2) : Math.min(1, t.alpha + dt / 1.5);
     if (t.gone && t.alpha <= 0) { trains.delete(id); continue; }
     MODEL.step(t, dt, now); // after a jump, stops it skipped are dropped by MODEL.arrivals; the one it lands on can still ping
+    if (t.free) stepFree(t, dt, now);
+    t.dr = t.free && t.freeRoute ? t.freeRoute : t.route; t.ds = t.free && t.freeRoute ? t.freeRoute.total : t.sDisp;
     if (t.gone || t.coupledTo) continue; // a coupled section arrives with its host
     const live = now - t.tMeas < 10 * 60000; // a stale report can still confirm a stop, but it isn't news
     for (const k of MODEL.arrivals(t)) {
@@ -645,7 +689,7 @@ const toWorld = (sx, sy) => [(sx - W / 2) / view.s + view.x, (sy - H / 2) / view
 let flight = null;
 const easeInOut = (u) => u < 0.5 ? 4 * u * u * u : 1 - (-2 * u + 2) ** 3 / 2;
 function flyTo(t, sTarget) {
-  pointAt(t.route, t.sDisp, tmpA);
+  pointAt(t.dr || t.route, t.dr ? t.ds : t.sDisp, tmpA);
   goal.active = false;
   const zoomSteps = Math.abs(Math.log2(sTarget / view.s));
   flight = { t, t0: performance.now(), dur: reduceMotion ? 0 : 700 + 160 * Math.min(4, zoomSteps),
@@ -655,7 +699,7 @@ function stepFlight(now) {
   const f = flight; if (!f) return false;
   if (!trains.has(f.t.id)) { flight = null; return false; }
   const u = f.dur ? Math.min(1, (now - f.t0) / f.dur) : 1, e = easeInOut(u);
-  placeAt(f.t.route, f.t.sDisp, tmpA);
+  placeAt(f.t.dr || f.t.route, f.t.dr ? f.t.ds : f.t.sDisp, tmpA);
   view.s = Math.exp(Math.log(f.s0) + (Math.log(f.s1) - Math.log(f.s0)) * e);
   view.x = tmpA[0] - f.dx * (1 - e) / view.s; view.y = tmpA[1] - f.dy * (1 - e) / view.s;
   lastViewChange = now;
@@ -727,7 +771,7 @@ function requestBase(now) {
   // when zooming out it already covers the screen while the animation plays
   let tv = !goal.active ? view : follow ? { s: goal.s, x: view.x, y: view.y } // following: the zoom is centered on the train
     : { s: goal.s, x: goal.ax - (goal.sx - W / 2) / goal.s, y: goal.ay - (goal.sy - H / 2) / goal.s };
-  if (flight) { pointAt(flight.t.route, flight.t.sDisp, tmpB); tv = { s: flight.s1, x: tmpB[0], y: tmpB[1] }; } // paint where the flight ends
+  if (flight) { pointAt(flight.t.dr || flight.t.route, flight.t.dr ? flight.t.ds : flight.t.sDisp, tmpB); tv = { s: flight.s1, x: tmpB[0], y: tmpB[1] }; } // paint where the flight ends
   const r = base.sent;
   let need = base.force || !r;
   if (r) {
@@ -875,7 +919,7 @@ qEl.onkeydown = (e) => { if (e.key === 'Escape') { openList(false); listBtn.focu
 function selectTrain(t) {
   // A train that's far off screen: jump there at the current zoom (quick to paint), then zoom in,
   // rather than flying across the country past map that can't be painted fast enough
-  pointAt(t.route, t.sDisp, tmpA);
+  pointAt(t.dr || t.route, t.dr ? t.ds : t.sDisp, tmpA);
   if (Math.hypot(tmpA[0] - view.x, tmpA[1] - view.y) * view.s > Math.max(W, H) * 0.6) {
     goal.active = false; view.x = tmpA[0]; view.y = tmpA[1]; base.force = true;
   }
@@ -941,6 +985,14 @@ function ago(ts) {
   const m = Math.round((Date.now() - ts) / 60000);
   return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : `${Math.floor(m / 60)} hr ${m % 60} min ago`;
 }
+// Reasons the feed gives for delays and disruptions (most delays come without one)
+function trainNotes(t) {
+  const i = t.info, out = [];
+  for (const a of i.alerts || []) { const m = (a && a.message || '').trim(); if (m && !out.includes(m)) out.push(m); }
+  const sm = (i.statusMsg || '').trim();
+  if (sm.length > 3 && !/^on ?time$/i.test(sm) && !out.includes(sm)) out.push(sm);
+  return out;
+}
 function trainFacts(t) {
   const i = t.info, next = i.stations.find(s => s.status === 'Enroute'), at = i.stations.find(s => s.status === 'Station');
   const late = t.late, lateTxt = late >= 60 ? `${Math.floor(late / 60)} hr ${late % 60} min late` : late >= 1 ? `${late} min late` : late <= -1 ? `${-late} min early` : 'On time';
@@ -969,6 +1021,8 @@ function renderTip() {
   const f = trainFacts(t);
   tip.className = 'card ' + t.tier;
   tip.replaceChildren(f.title, f.row('To', placeName(t.info.destName, t.info.destCode)), ...f.rows);
+  const notes = trainNotes(t);
+  if (notes.length) { const d = document.createElement('div'); d.className = 'note'; d.textContent = notes[0].length > 110 ? notes[0].slice(0, 107) + '…' : notes[0]; tip.append(d); }
   tip.hidden = false;
   tipW = tip.offsetWidth; tipH = tip.offsetHeight; // measured once per content change, not per frame
   placeTip();
@@ -1005,6 +1059,9 @@ function renderInfo(now) {
     f.rows.splice(2, 0, f.row('Distance to stop', mi < 0.1 ? 'Arriving' : `${mi < 10 ? mi.toFixed(1) : Math.round(mi)} mi`));
   }
   $('infoRows').replaceChildren(...f.rows);
+  const notes = trainNotes(t), nb = $('infoNotes');
+  nb.hidden = !notes.length;
+  if (notes.length) nb.replaceChildren(Object.assign(document.createElement('div'), { className: 'eyebrow', textContent: 'From Amtrak' }), ...notes.slice(0, 3).map(m => Object.assign(document.createElement('div'), { textContent: m })));
   // Fetch detail ahead of the train so following never outruns the map
   const pts = [], r = t.route, reach = (Math.max(W, H) * 1.5) / view.s;
   for (let k = 1; k <= 6; k++) { pointAt(r, t.sDisp + reach * k / 6, tmpA); pts.push(tmpA[0], tmpA[1]); }
@@ -1105,7 +1162,7 @@ function strokeRange(c, r, sa, sb, width, rgb, a0, a1) {
 // Soft effects: the trail behind each train and its glow. A few gradient strokes per train taper
 // the trail (thin and faint at the far end, brighter near the cars).
 function drawTrainFx(c, t, G) {
-  const r = t.route, a = t.alpha, rgb = RGB[t.tier], s = view.s, head = t.sDisp;
+  const r = t.dr || t.route, a = t.alpha, rgb = RGB[t.tier], s = view.s, head = t.dr ? t.ds : t.sDisp;
   // As a dot the train has no length, and a shorter trail keeps busy corridors readable
   const trainKm = t.consist.n * (G.carKm + G.gapKm) * (1 - G.dot), tail0 = head - trainKm;
   const trailKm = Math.min((70 + 110 * G.far) * (1 - 0.6 * G.dot) / s, 400), trailA = (0.25 + 0.55 * G.far) * a;
@@ -1138,7 +1195,7 @@ function trainBodies(order, G) {
   const pathFor = (key) => batch[key] || (batch[key] = new Path2D());
   hits.clear();
   for (const t of order) {
-    const r = t.route, head = t.sDisp, n = G.dot >= 1 ? 0 : t.consist.n, kind = t.consist.kind;
+    const r = t.dr || t.route, head = t.dr ? t.ds : t.sDisp, n = G.dot >= 1 ? 0 : t.consist.n, kind = t.consist.kind;
     const fading = t.alpha < 0.999, target = fading ? { loco: new Path2D(), car: new Path2D(), dot: new Path2D(), t } : null;
     if (fading) solo.push(target);
     placeAt(r, head, tmpA);
@@ -1184,6 +1241,7 @@ function drawTrains(order) {
   }
 }
 function drawSelected(t) { // the route ahead and an outline for the hovered or followed train
+  if (t.free) { const h = hits.get(t); if (h) { ctx.strokeStyle = `rgba(${RGB[t.tier]},0.5)`; ctx.lineWidth = h.w + 3; ctx.lineCap = 'round'; ctx.globalAlpha = 0.35; ctx.beginPath(); ctx.moveTo(h.pts[0], h.pts[1]); for (let i = 2; i < h.n; i += 2) ctx.lineTo(h.pts[i], h.pts[i + 1]); ctx.stroke(); ctx.globalAlpha = 1; } return; } // no known track ahead to draw
   const r = t.route, rgb = RGB[t.tier], head = t.sDisp, s = view.s;
   ctx.save(); ctx.strokeStyle = `rgba(${rgb},0.35)`; ctx.lineWidth = 1.2; ctx.setLineDash([2, 5]);
   const n = routeScreen(r, head, Math.min(r.total, head + Math.hypot(W, H) / s * 1.2));
@@ -1249,7 +1307,7 @@ function frame(now) {
     const t = trains.get(follow);
     if (!t) setFollow(null);
     else {
-      placeAt(t.route, t.sDisp, tmpA);
+      placeAt(t.dr || t.route, t.dr ? t.ds : t.sDisp, tmpA);
       const k = Math.min(1, dt * 4), mx = (tmpA[0] - view.x) * k, my = (tmpA[1] - view.y) * k;
       view.x += mx; view.y += my;
       if (Math.hypot(mx, my) * view.s > 2) lastViewChange = now; // still flying to the train: treat as moving
@@ -1270,7 +1328,7 @@ function frame(now) {
   const order = [];
   for (const t of trains.values()) {
     if (t.coupledTo && trains.has(t.coupledTo)) continue; // drawn as part of the train it's coupled to
-    pointAt(t.route, t.sDisp, tmpA);
+    pointAt(t.dr || t.route, t.dr ? t.ds : t.sDisp, tmpA);
     if (tmpA[0] < vx0 - pad || tmpA[0] > vx1 + pad || tmpA[1] < vy0 - pad || tmpA[1] > vy1 + pad) continue;
     order.push(t);
   }
